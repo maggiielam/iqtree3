@@ -20,6 +20,7 @@
 
 #include <stdarg.h>
 #include "superalignment.h"
+#include "barcodealignment.h"
 #include "nclextra/msetsblock.h"
 #include "nclextra/myreader.h"
 #include "main/phylotesting.h"
@@ -28,8 +29,14 @@
 Alignment *createAlignment(string aln_file, const char *sequence_type, InputType intype, string model_name) {
     bool is_dir = isDirectory(aln_file.c_str());
 
-    if (!is_dir && aln_file.find(',') == string::npos)
+    // Check for CSV barcode format
+    if (!is_dir && aln_file.find(',') == string::npos) {
+        InputType detected = detectInputFile(aln_file.c_str());
+        if (detected == IN_CSV) {
+            return new BarcodeAlignment((char*)aln_file.c_str(), (char*)sequence_type, intype, model_name);
+        }
         return new Alignment((char*)aln_file.c_str(), (char*)sequence_type, intype, model_name);
+    }
 
     SuperAlignment *super_aln = new SuperAlignment;
     if (is_dir)

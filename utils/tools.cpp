@@ -6696,6 +6696,8 @@ InputType detectInputFile(const char *input_file) {
                       else if (ch2 == 'O') return IN_COUNTS;
                       else return IN_OTHER;
             case '!': if (ch2 == '!') return IN_MSF; else return IN_OTHER;
+            case ',': return IN_CSV; // CSV barcode format: header starts with comma
+            case '"': return IN_CSV; // CSV barcode format: header starts with quote
             default:
                 if (isdigit(ch)) return IN_PHYLIP;
                 return IN_OTHER;

@@ -11,6 +11,8 @@ alignmentsummary.cpp
 alignmentsummary.h
 maalignment.cpp
 maalignment.h
+barcodealignment.cpp
+barcodealignment.h
 superalignment.cpp
 superalignment.h
 superalignmentpairwise.cpp
