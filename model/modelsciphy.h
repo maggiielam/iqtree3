@@ -80,12 +80,7 @@ public:
     virtual double computeFunction(double value);
 
     /**
-        No-op override. SciPhy is matrix-free -- transition probabilities are
-        computed directly on tape vectors by PhyloTreeSciPhy::transProbVec, so
-        there is no rate matrix to decompose. Without this override, the
-        inherited ModelMarkov::decomposeRateMatrix() routes to
-        decomposeRateMatrixNonrev() which throws "Empty Q matrix" because our
-        rate_matrix buffer is never populated.
+        No-op override. 
     */
     virtual void decomposeRateMatrix() {}
 
@@ -118,7 +113,7 @@ protected:
     const std::vector<double> edit_probs;
     const double origin_time;
 
-
+    // TODO: might have to use these if we want to infer edit probabilities or origin time
     // enum WhichParam { OPT_NONE, OPT_CLOCK, OPT_EDIT_ALPHA, OPT_ORIGIN };
     // WhichParam current_opt_param;
     // int current_alpha_idx;
@@ -131,7 +126,6 @@ protected:
 
     // void syncOriginBranchLength();
     // double currentTreeHeight() const;
-
 };
 
 #endif // MODELSCIPHY_H_

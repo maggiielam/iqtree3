@@ -1,3 +1,10 @@
+/*
+ * phylotreesciphy.h
+ *
+ *  Created on: Jul 6, 2026
+ *      Author: Maggie Lam
+ */
+
 #ifndef PHYLOTREESCIPHY_H
 #define PHYLOTREESCIPHY_H
 
@@ -10,6 +17,7 @@ class BarcodeAlignment;
 
 /**
  * Per-node ancestor list and parallel partial-likelihood values.
+ * TODO(perf): currently rebuilt from scratch every likelihood evaluation, need to implement caching
  */
 struct SciPhyAncestorPartials {
     std::vector<std::vector<int>> ancestors;
@@ -27,30 +35,20 @@ public:
 
     virtual double computeLikelihood(double *pattern_lh = nullptr, bool save_log_value = true) override;
 
-    // Single-edge likelihood evaluation used by Brent during branch-length
-    // optimization.  Reuses computeSciPhyLikelihood internally; the only job
-    // here is to install (dad_branch, dad) as the active rooting edge so the
-    // recursion picks the right edge to combine across.
+    // Single-edge likelihood evaluation used by Brent during branch-length optimization. 
+    // always combines at the fixed origin pseudo-branch
+    // TODO(perf): will probably change once we implement caching of partial likelihoods at internal nodes
     virtual double computeLikelihoodBranch(PhyloNeighbor *dad_branch, PhyloNode *dad,
                                            bool save_log_value = true) override;
 
     /**
-    * "Cached" re-evaluation hook used by NNI scoring (and a few other fast paths).  
-    * The base class expects a SIMD theta buffer to have been populated by a prior computeLikelihood call and asserts on it.
-    * 
     * Currently we just call a fresh computeLikelihood because there is no SIMD kernel for SciPhy.
     */
     virtual double computeLikelihoodFromBuffer() override;
 
     /**
-     * Fill per-pattern log-likelihoods from the SciPhy kernel.
+     * Fill per-pattern log-likelihoods from the SciPhy kernel instead of from theta buffers.
      *
-     * The base PhyloTree version walks the reversible partial-likelihood /
-     * theta buffers, which the SciPhy path never populates -- so it segfaults
-     * when called during post-search reporting (e.g. computeLogLVariance ->
-     * computePatternLikelihood, which produces the "Log-likelihood ... +/- se"
-     * line). computeSciPhyLikelihood already computes _pattern_lh[ptn] for
-     * every pattern, so we just route through it.
      */
     virtual void computePatternLikelihood(double *pattern_lh, double *cur_logl = nullptr,
                                           double *pattern_lh_cat = nullptr,
@@ -80,41 +78,28 @@ protected:
     double computeSciPhyPatternLogLikelihood(size_t ptn) const;
 
     // Compute transition probability between two raw tape vectors over time t.
-    // This is the per-site SciPhy editing kernel: it never materializes a Q
-    // matrix and operates directly on the integer tape vectors.
     double transProbVec(const std::vector<int> &parent_tape,
                         const std::vector<int> &child_tape,
                         double branch_length) const;
 
-    // Compatibility wrapper: looks up tape vectors from compound state
-    // indices and forwards to transProbVec.  Retained because the global
-    // 13-state encoding still appears in some non-likelihood code paths.
+    // Compatibility wrapper: looks up tape vectors from compound state indices and forwards to transProbVec.
     double transProb(size_t parent_state, size_t child_state, double branch_length) const;
 
     /**
-     * Enumerate all possible ancestral tape vectors of a given tape, by sequentially removing 
-     * edits from the right end until the tape is fully unedited.  
+     * Enumerate all possible ancestral tape vectors of a given tape, by sequentially removing edits from the right end until the tape is fully unedited.  
      * Equivalent to SciPhyTreeLikelihood.getPossibleAncestors.
      */
     static std::vector<std::vector<int>> getPossibleAncestors(const std::vector<int> &tape_vec);
 
-    // Recursive post-order build of (ancestor list, partial likelihood
-    // vector) at each node, exactly as in the BEAST SciPhy likelihood:
+    // Recursive post-order build of (ancestor list, partial likelihood vector) at each node
     //   - leaf: ancestors = getPossibleAncestors(observed tape);
     //           partial_lh = [1, 0, 0, ...]   (mass on the observed value)
     //   - internal: ancestors = intersection of children's ancestor lists;
     //               partial_lh[s] = prod_child sum_c transProbVec(s, c, t_c)
     //                                                * child.partial_lh[c]
-    // Results are memoized by (node id, parent id) so the two calls from
-    // the chosen root edge share intermediate computations.
     SciPhyAncestorPartials computeSubtreeAncestorPartials(
         Node *node, Node *parent, size_t ptn,
         std::map<std::pair<int, int>, SciPhyAncestorPartials> &memo) const;
-
-    // Legacy helper retained for backward-compatibility with earlier phase-1
-    // scaffolding.  The new ancestor-list path uses an inline "tape is all
-    // zeros" check instead.
-    std::vector<double> getRootPrior() const;
 
     int getObservedLeafState(Node *leaf, size_t ptn) const;
 

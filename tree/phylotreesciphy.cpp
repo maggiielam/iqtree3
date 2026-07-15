@@ -1,3 +1,10 @@
+/*
+ * phylotreesciphy.cpp
+ *
+ *  Created on: Jul 6, 2026
+ *      Author: Maggie Lam
+ */
+
 #include "phylotreesciphy.h"
 
 #include "alignment/barcodealignment.h"
@@ -136,12 +143,7 @@ double PhyloTreeSciPhy::transProbVec(const std::vector<int> &parent,
     const int k = (int)new_inserts.size();
     if (k > nr_possible) return 0.0;  // logically unreachable, defensive.
 
-    // Scar-type factor.  Use the model's edit_probs when available
-    // (populated from --edit-probs or defaulted to uniform 1/M by
-    // ModelFactory).  Fall back to uniform 1/M defensively if the vector
-    // is somehow shorter than M -- this shouldn't happen in normal use,
-    // since ModelFactory enforces edit_probs.size() == M at model
-    // construction time.
+    // Scar-type factor.  Use the model's edit_probs when available (populated from --edit-probs or defaulted to uniform 1/M by ModelFactory).  
     const double per_scar_uniform = 1.0 / (double)M;
     const int n_edit_probs = (int)edit_probs.size();
     double insert_factor = 1.0;
@@ -155,8 +157,7 @@ double PhyloTreeSciPhy::transProbVec(const std::vector<int> &parent,
     const double distance = std::max(0.0, lambda * branch_length);
 
     if (k == nr_possible) {
-        // Absorbing case: tape is now fully edited.  Probability is the
-        // tail mass P(>= nr_possible events) under Poisson(distance).
+        // Absorbing case: tape is now fully edited.  Probability is the tail mass P(>= nr_possible events) under Poisson(distance).
         double absorb_prob = 1.0;
         for (int i = 0; i < nr_possible; ++i) {
             absorb_prob -= poissonPMF(i, distance);
@@ -179,10 +180,8 @@ double PhyloTreeSciPhy::transProb(size_t parent_state, size_t child_state, doubl
 
 std::vector<std::vector<int>>
 PhyloTreeSciPhy::getPossibleAncestors(const std::vector<int> &tape_vec) {
-    // Walk the tape from right to left, clearing edits one at a time.  Every
-    // partial sequence we visit is a valid ancestral state under the SciPhy
-    // model (edits fill from the front of the tape and are absorbing, so any
-    // strict prefix of edits is a legal ancestor).
+    // Walk the tape from right to left, clearing edits one at a time.  
+    // Every partial sequence we visit is a valid ancestral state.
     std::vector<std::vector<int>> ancestors;
     if (tape_vec.empty()) {
         return ancestors;
@@ -198,51 +197,9 @@ PhyloTreeSciPhy::getPossibleAncestors(const std::vector<int> &tape_vec) {
     return ancestors;
 }
 
-std::vector<double> PhyloTreeSciPhy::getRootPrior() const {
-    // Retained for backwards compatibility.  The per-node ancestor list path
-    // uses an inline "is all zeros" test on the candidate ancestor instead.
-    const int nstates = std::max(2, model->num_states);
-    std::vector<double> prior((size_t)nstates, 0.0);
-
-    const BarcodeAlignment *barcode_aln = dynamic_cast<const BarcodeAlignment*>(aln);
-    if (!barcode_aln) {
-        const double uniform = 1.0 / (double)nstates;
-        std::fill(prior.begin(), prior.end(), uniform);
-        return prior;
-    }
-
-    int zero_state = -1;
-    for (int s = 0; s < barcode_aln->getNumTapeStates(); ++s) {
-        const std::vector<int> &vec = barcode_aln->getTapeVec(s);
-        bool all_zero = true;
-        for (int v : vec) {
-            if (v != 0) {
-                all_zero = false;
-                break;
-            }
-        }
-        if (all_zero) {
-            zero_state = s;
-            break;
-        }
-    }
-
-    if (zero_state >= 0 && zero_state < nstates) {
-        prior[(size_t)zero_state] = 1.0;
-        return prior;
-    }
-
-    const double uniform = 1.0 / (double)nstates;
-    std::fill(prior.begin(), prior.end(), uniform);
-    return prior;
-}
-
 namespace {
 
-// Vector intersection that preserves the order of `a` and removes any element
-// not present in `b`.  O(|a|*|b|) which is fine for the small per-node
-// ancestor lists we expect (typically <= number of edits in any descendant
-// tape, so single digits).
+// Vector intersection that preserves the order of `a` and removes any element not present in `b`. 
 std::vector<std::vector<int>> intersectAncestorLists(
         const std::vector<std::vector<int>> &a,
         const std::vector<std::vector<int>> &b) {
@@ -257,14 +214,6 @@ std::vector<std::vector<int>> intersectAncestorLists(
         }
     }
     return out;
-}
-
-bool tapeIsAllZero(const std::vector<int> &v) {
-    if (v.empty()) return false;
-    for (int x : v) {
-        if (x != 0) return false;
-    }
-    return true;
 }
 
 }  // anonymous namespace
@@ -292,29 +241,11 @@ SciPhyAncestorPartials PhyloTreeSciPhy::computeSubtreeAncestorPartials(
     }
 
     if (node->isLeaf()) {
-        // ----------------------------------------------------------------
-        // Phase 2: synthetic __root__ leaf = SciPhy founder-state delta.
-        // ----------------------------------------------------------------
-        // The synthetic leaf inserted by convertToRooted() is not a real
-        // observed taxon -- it stands in for the unobserved biological
-        // founder at the origin of the experiment.  Under SciPhy the
-        // founder state is always the all-zeros tape (no scars accumulated
-        // yet).  So we hard-wire this leaf's:
+        // The synthetic leaf inserted by convertToRooted() is not a real observed taxon, it represents the unobserved biological
+        //      founder at the origin of the experiment.
+        // Under SciPhy the founder state is always the unedited tape.  So we hard-code this leaf's:
         //   ancestor list  = a single element, the all-zeros tape
         //   partial_lh     = mass 1.0 on that single state
-        //
-        // This is the "delta prior on (0,...,0) at the origin" that the
-        // rewrite comment on the OLD combination loop was waiting for.
-        // Once this is set, the ancestor-set intersection at root_int
-        // (the internal node just below the synthetic root) will
-        // automatically be constrained to states reachable from the
-        // all-zeros founder via a prefix-of-edits trail.  And the
-        // combination loop in computeSciPhyPatternLogLikelihood collapses
-        // to the SciPhy origin-branch closure:
-        //     P(tree) = sum_s transProbVec((0,...,0), s, t_origin) * partial(s)
-        //
-        // This matches the BEAST SciPhy reference implementation exactly
-        // (see calculateOriginPartial in the Java code).
         if (node->name == ROOT_NAME) {
             int site_count = 0;
             const auto &tsc = barcode_aln->getTapeSiteCounts();
@@ -326,17 +257,9 @@ SciPhyAncestorPartials PhyloTreeSciPhy::computeSubtreeAncestorPartials(
         }
 
         // Regular observed leaf.
-        //
-        // Leaf ancestor list = prefix-of-edits trail of the observed tape.
-        // Partial likelihood places all mass on the observed value (slot 0
-        // of getPossibleAncestors output); the rest of the list exists so
-        // that the parent's intersection sees the correct possibilities.
         const int obs = getObservedLeafState(node, ptn);
         if (obs < 0 || obs >= barcode_aln->getNumTapeStates()) {
-            // Unknown/ambiguous leaf: fall back to "no edits", a single
-            // ancestor state with full mass.  This branch is defensive --
-            // buildTapeAlignment always assigns a valid compound state to
-            // every leaf, so we should not normally reach here.
+            // defensive fallback for unknown/ambiguous leaf
             int site_count = 0;
             const auto &tsc = barcode_aln->getTapeSiteCounts();
             if (!tsc.empty()) site_count = tsc[0];
@@ -355,8 +278,7 @@ SciPhyAncestorPartials PhyloTreeSciPhy::computeSubtreeAncestorPartials(
         return result;
     }
 
-    // Internal node: gather child neighbors (everything except the edge back
-    // toward `parent`).
+    // Internal node: gather child neighbors (everything except the edge back toward `parent`).
     std::vector<const Neighbor*> children;
     for (NeighborVec::const_iterator nit = node->neighbors.begin();
          nit != node->neighbors.end(); ++nit) {
@@ -378,10 +300,8 @@ SciPhyAncestorPartials PhyloTreeSciPhy::computeSubtreeAncestorPartials(
     }
 
     // Ancestor list at this node = intersection of children's ancestor lists.
-    // If the intersection is empty, the data is inconsistent with the model
-    // at this internal node and the partial likelihood there must be zero;
-    // we simply return an empty (ancestors, partial_lh) pair and let the
-    // caller propagate the zero upward.
+    // If the intersection is empty, the data is inconsistent with the model, we return an empty (ancestors, partial_lh) pair 
+    //      and propagate the zero upward.
     result.ancestors = child_data[0].ancestors;
     for (size_t k = 1; k < child_data.size(); ++k) {
         result.ancestors = intersectAncestorLists(result.ancestors,
@@ -420,35 +340,9 @@ SciPhyAncestorPartials PhyloTreeSciPhy::computeSubtreeAncestorPartials(
 }
 
 double PhyloTreeSciPhy::computeSciPhyPatternLogLikelihood(size_t ptn) const {
-    // ------------------------------------------------------------------
-    // Phase 3 + 4: deterministic combination edge and origin-branch closure.
-    // ------------------------------------------------------------------
     // The combination edge is ALWAYS the origin pseudo-branch: the unique
     // edge between the synthetic __root__ leaf (root) and its sole
     // neighbor (root_int, an internal node inserted by convertToRooted()).
-    //
-    // Why not use current_it / current_it_back like the OLD code?
-    //   Because current_it is owned by the branch-length optimizer.  Brent
-    //   installs the branch it is currently optimizing there so that its
-    //   computeFunction(x) callback can update lengths in place.  Reading
-    //   current_it for LL combination coupled two independent concerns:
-    //   "which branch is being optimized" and "which edge closes the tree
-    //   likelihood".  Under a non-reversible model those must be
-    //   independent -- the closure edge has to be fixed for the tree LL to
-    //   be well-defined, regardless of what Brent is doing.
-    //
-    // Why is this correct?
-    //   The synthetic root leaf's ancestor list is by construction the
-    //   singleton {(0,...,0)} with mass 1.0 (see Phase 2 in
-    //   computeSubtreeAncestorPartials).  So the outer sum below collapses
-    //   to a single term and the whole closure becomes:
-    //     P(pattern) = sum_s transProbVec((0,...,0), s, t_origin) * partial(s)
-    //   which is exactly the SciPhy origin-branch closure formula used by
-    //   BEAST's SciPhyTreeLikelihood.calculateOriginPartial.
-    //
-    // Defensive invariants that must hold before the recursion runs.  These
-    // are guaranteed by ModelSciPhy's constructor, which triggers
-    // convertToRooted() on the tree via ModelMarkov's adapt_tree path.
     if (!rooted || !root || root->name != ROOT_NAME) {
         return -std::numeric_limits<double>::infinity();
     }
@@ -456,43 +350,23 @@ double PhyloTreeSciPhy::computeSciPhyPatternLogLikelihood(size_t ptn) const {
         return -std::numeric_limits<double>::infinity();
     }
 
-    // The synthetic root leaf has exactly one neighbor (root_int) by
-    // construction.  That neighbor's edge is the origin pseudo-branch.
+    // The synthetic root leaf has exactly one neighbor (root_int), that neighbor's edge is the origin pseudo-branch.
     PhyloNeighbor *origin_edge = (PhyloNeighbor*)root->neighbors[0];
     Node *root_like  = root;                // synthetic __root__ leaf: founder delta
     Node *other_side = origin_edge->node;   // root_int: top of the biological tree
 
-    // Recurse into both halves at the origin pseudo-branch.  Because
-    // root_like is a leaf (with the special-cased founder partials), the
-    // first recursion returns immediately with the singleton ancestor
-    // list.  The second recursion walks the entire biological tree below
-    // root_int, doing the ancestor-set intersection / child-product
-    // computation that was validated against the SciPhy Python reference
-    // to 3.7e-11 on the cherry and 3-leaf tests.
+    // Recurse into both halves at the origin pseudo-branch
     std::map<std::pair<int, int>, SciPhyAncestorPartials> memo;
     const SciPhyAncestorPartials root_data =
         computeSubtreeAncestorPartials(root_like, other_side, ptn, memo);
     const SciPhyAncestorPartials other_data =
         computeSubtreeAncestorPartials(other_side, root_like, ptn, memo);
 
-    // t = length of the origin pseudo-branch.  convertToRooted() sets
-    // this to 0 by default.  At t=0 the transProbVec kernel returns 1
-    // only for identity transitions (state s -> state s) and 0 otherwise,
-    // so the closure with the founder delta becomes:
-    //     P(pattern) = partial_at_root_int[(0,...,0)]
-    // which is the "SciPhy without origin partial" formulation matching
-    // the -49.16 ground truth we computed for the 5-taxon demo.
-    //
-    // Once ModelSciPhy adds a free origin_time parameter, the origin
-    // branch length will become (origin_time - tree_height) * clock_rate
-    // and this same closure will produce the "SciPhy with origin partial"
-    // value.  No code change needed here.
     const double t = std::max(0.0, origin_edge->length);
     double pattern_prob = 0.0;
     const double eps = 1e-300;
 
-    // Founder-delta closure: sum over root_data's ancestors (a singleton),
-    // and for each, transition through the origin pseudo-branch to every
+    // Founder-delta closure: sum over root_data's ancestors (a singleton), and for each, transition through the origin pseudo-branch to every
     // possible state at root_int.
     for (size_t s_idx = 0; s_idx < root_data.ancestors.size(); ++s_idx) {
         if (root_data.partial_lh[s_idx] <= 0.0) continue;
@@ -518,14 +392,8 @@ double PhyloTreeSciPhy::computeSciPhyPatternLogLikelihood(size_t ptn) const {
 double PhyloTreeSciPhy::computeSciPhyLikelihood(double *pattern_lh, bool save_log_value) {
     (void)save_log_value;
 
-    // The tree must already be rooted by the time we get here. Rooting is
-    // performed once, up front, by ModelSciPhy's constructor -- which calls
-    // ModelMarkov(..., /*reversible=*/false, /*adapt_tree=*/true), which in
-    // turn calls phylo_tree->convertToRooted().
-    //
-    // We only need to keep the origin pseudo-branch length in sync with
-    // (origin_time - tree_height) each call, since tree_height changes as
-    // branches / NNI swaps modify the tree.
+    // Keep the origin pseudo-branch length in sync with (origin_time - tree_height) each call, 
+    //      since tree_height changes as branches / NNI swaps modify the tree.
     syncOriginBranchLength();
 
     if (!_pattern_lh) {
@@ -544,10 +412,7 @@ double PhyloTreeSciPhy::computeSciPhyLikelihood(double *pattern_lh, bool save_lo
         memmove(pattern_lh, _pattern_lh, nptn * sizeof(double));
     }
 
-    // Full-precision debug print (opt-in). Set IQTREE_SCIPHY_PRINTLL=1 to emit
-    // the tree log-likelihood at 15 significant digits on every evaluation --
-    // the last line printed for a fixed-tree (-te -blfix) run is the final
-    // value, for comparison against the SciPhy/BEAST reference to ~1e-12.
+    // Full-precision debug print (opt-in). Set IQTREE_SCIPHY_PRINTLL=1 to print log-likelihood at 15 sigfigs
     if (std::getenv("IQTREE_SCIPHY_PRINTLL")) {
         std::cout << std::setprecision(15)
                   << "SciPhy tree logL = " << tree_lh << std::endl;
@@ -571,36 +436,13 @@ double PhyloTreeSciPhy::computeLikelihoodBranch(PhyloNeighbor *dad_branch,
         return IQTree::computeLikelihoodBranch(dad_branch, dad, save_log_value);
     }
 
-    // Phase 3: the LL combination edge is always the origin pseudo-branch
-    // (see computeSciPhyPatternLogLikelihood), independent of whichever
-    // branch Brent is currently optimizing.
-    //
-    // We deliberately do NOT install (dad_branch, dad) as current_it any
-    // more.  That was the OLD behavior and it was the direct cause of
-    // the "same tree, different LL" bouncing: every Brent call, every
-    // NNI candidate evaluation, would silently reinstall a new
-    // combination edge and produce a different LL for logically the
-    // same tree state.
-    //
-    // Brent still uses current_it / current_it_back for its own
-    // bookkeeping (updating branch lengths via computeFunction(x)), but
-    // those pointers are installed by optimizeOneBranch, not by us.
-    // The branch-length update reaches the LL through the tree
-    // structure itself: transProbVec reads child_nei->length inside
-    // computeSubtreeAncestorPartials, and that length was written by
-    // Brent onto the neighbor object.  No shared mutable state needed.
     (void)dad_branch;
     (void)dad;
     return computeSciPhyLikelihood(nullptr, save_log_value);
 }
 
 double PhyloTreeSciPhy::computeLikelihoodFromBuffer() {
-    // The base-class version reads a SIMD theta buffer that we never populate
-    // in the SciPhy code path -- it asserts on `theta_all && theta_computed`
-    // at phylokernelnew.h:3291 and crashes the moment NNI evaluation invokes
-    // it.  Redirect through our own per-node ancestor-list recursion using
-    // the active (current_it, current_it_back) rooting edge.  This is slower
-    // than a cached re-evaluation would be, but correct.
+    // we do not have a SIMD kernel, so we ignore the buffer and just call computeSciPhyLikelihood directly
     if (!hasBarcodeAlignment() || !useExperimentalSciPhyLikelihood()) {
         return IQTree::computeLikelihoodFromBuffer();
     }
@@ -614,8 +456,7 @@ void PhyloTreeSciPhy::computePatternLikelihood(double *pattern_lh, double *cur_l
         return;
     }
 
-    // computeSciPhyLikelihood fills _pattern_lh[ptn] with the per-pattern log
-    // likelihood and (when pattern_lh != nullptr) memmoves it into pattern_lh.
+    // computeSciPhyLikelihood fills _pattern_lh[ptn] with the per-pattern log likelihood and (when pattern_lh != nullptr) moves it into pattern_lh.
     const double tree_lh = computeSciPhyLikelihood(pattern_lh, true);
 
     if (cur_logl) {
@@ -641,8 +482,7 @@ void PhyloTreeSciPhy::optimizeOneBranch(PhyloNode *node1, PhyloNode *node2,
         return;
     }
 
-    // Skip the synthetic root edge in rooted-tree storage mode (matches
-    // PhyloTree::optimizeOneBranch behavior).
+    // Skip the synthetic root edge in rooted-tree storage mode
     if (rooted && (node1 == root || node2 == root)) {
         return;
     }
@@ -697,11 +537,7 @@ double PhyloTreeSciPhy::optimizeAllBranches(int my_iterations, double tolerance,
     for (int iter = 0; iter < my_iterations; ++iter) {
         const double prev_lh = tree_lh;
 
-        // Save branch lengths before the sweep so we can roll back exactly
-        // if the sweep regresses.  Without this, reporting `tree_lh =
-        // prev_lh` on regression is dishonest -- the tree state would still
-        // hold the worse branches and the next caller (NNI's assertion at
-        // iqtree.cpp:3291) would see the mismatch and abort.
+        // Save branch lengths before the sweep so we can roll back exactly if the sweep regresses.  
         saveBranchLengths(saved_lengths);
 
         for (size_t j = 0; j < nodes.size(); ++j) {
@@ -723,10 +559,8 @@ double PhyloTreeSciPhy::optimizeAllBranches(int my_iterations, double tolerance,
             break;
         }
 
-        // Regression: with the per-branch monotonicity guard in
-        // optimizeOneBranch this should be extremely rare, but if it
-        // happens we restore the pre-sweep branch lengths so the reported
-        // tree_lh matches the actual tree state.
+        // Regression: with the per-branch monotonicity guard in optimizeOneBranch this should be extremely rare if never, 
+        //      but if it happens we restore the pre-sweep branch lengths
         if (tree_lh < prev_lh - tolerance * 0.1) {
             if (verbose_mode >= VB_MED) {
                 std::cout << "SciPhy brlen optimization regression: "

@@ -1219,19 +1219,10 @@ ModelSubst* createModel(string model_str, ModelsBlock *models_block,
 			}
 
 			ModelSciPhy *sciphy_model = new ModelSciPhy(tree, edit_probs, origin_time);
-			// --clock-rate: set initial value and lock it out of Brent
-			// optimization. Used to reproduce BEAST/SciPhy reference LL
-			// under fixed model parameters.
-			//
-			// Guard is strictly > 0.0 (not >= 0.0): a clock rate of exactly 0
-			// makes every branch distance clock*length == 0, so the only
-			// non-zero transition is "no edit" and every edited tape is floored
-			// to ~1e-300 -- a degenerate likelihood independent of the tree.
-			// The Params singleton is zero-initialized, so an unset
-			// sciphy_clock_rate can arrive as 0.0; treating that as "user fixed
-			// the clock at 0" silently collapses the model. Only a positive
-			// value is a real user request to fix the clock; anything else
-			// (0.0 or the -1.0 sentinel) leaves the clock to be estimated.
+			// --clock-rate: set initial value and lock it out of Brent optimization. 
+            // Used to fix model parameters for testing.
+			
+			// Ensure clock rate is strictly > 0.0 (not >= 0.0)
 			if (sp_params.sciphy_clock_rate > 0.0) {
 				sciphy_model->fixClockRate(sp_params.sciphy_clock_rate);
 			}

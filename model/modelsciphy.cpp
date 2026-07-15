@@ -28,25 +28,13 @@ ModelSciPhy::ModelSciPhy(PhyloTree *tree,
     name      = "SciPhy";
     full_name = "SciPhy";
 
-    // ModelMarkov's constructor leaves freq_type = FREQ_UNKNOWN, which the
-    // printAnalysisInfo() switch in phyloanalysis.cpp doesn't recognize.
-    // SciPhy has no equilibrium frequencies (edit_probs is applied at
-    // insertion time, not as an equilibrium), so FREQ_EQUAL is the least-
-    // wrong label for the report.
+    // just for printing info about the model, not used for likelihood calculations
     freq_type = FREQ_EQUAL;
 
-    // -----------------------------------------------------------------
-    // Populate the inherited rate_matrix and state_freq with Mk-style
-    // (Lewis 2001) defaults. SciPhy itself doesn't use these -- our
-    // transProbVec and computeSubtreeAncestorPartials compute
-    // probabilities directly on tape vectors. But the base-class matrix
-    // machinery (used during the initial pairwise ML-distance
-    // computation for BIONJ, and by writeInfo / reportModel) reads them,
-    // and will crash if they're left uninitialized. This mirrors what
-    // ModelMorphology's ModelMarkov::init(FREQ_EQUAL) would do -- an Mk
-    // model with uniform off-diagonal rates and uniform state
-    // frequencies.
-    // -----------------------------------------------------------------
+    // Populate the inherited rate_matrix and state_freq with Mk-style defaults. 
+    // SciPhy itself doesn't use these but the base-class matrix machinery (used during the initial pairwise ML-distance
+    // computation for BIONJ, and by writeInfo / reportModel) reads them
+    // TODO: check how initial trees are being constructed, if it would be cleaner to just not use BIONJ
     if (num_states > 1) {
         // rate_matrix is num_states*num_states, stored row-major.
         const double off_diag = 1.0 / (double)(num_states - 1);
