@@ -12,11 +12,16 @@
 #include "modelbin.h"
 #include "modelcodon.h"
 #include "modelmorphology.h"
+#include "modelsciphy.h"
 #include "modelset.h"
 #include "modelmixture.h"
 #include "modelpomo.h"
 //#include "phylokernelmixture.h"
 #include "modelpomomixture.h"
+#include "alignment/barcodealignment.h"
+
+#include <sstream>
+#include <string>
 
 using namespace std;
 
@@ -1175,7 +1180,65 @@ ModelSubst* createModel(string model_str, ModelsBlock *models_block,
 	} else if (tree->aln->seq_type == SEQ_CODON) {
 		model = new ModelCodon(model_str.c_str(), model_params, freq_type, freq_params, tree);
 	} else if (tree->aln->seq_type == SEQ_MORPH) {
-		model = new ModelMorphology(model_str.c_str(), model_params, freq_type, freq_params, tree);
+		// Detect a SciPhy barcode alignment. BarcodeAlignment uses
+		// SEQ_MORPH as its underlying seq_type, but SciPhy is a
+		// non-reversible Poisson editing process rather than a Markov
+		// morphological model, so we route it to ModelSciPhy instead of
+		// the default ModelMorphology.
+		BarcodeAlignment *bcaln = dynamic_cast<BarcodeAlignment*>(tree->aln);
+		if (bcaln) {
+			Params &sp_params = Params::getInstance();
+			int M = std::max(1, bcaln->getMaxInsertionType());
+
+			// --edit-probs "p1,p2,...,pM" -- comma-separated known
+			// distribution over scar identities. Default: uniform 1/M.
+			std::vector<double> edit_probs;
+			if (!sp_params.sciphy_edit_probs.empty()) {
+				std::stringstream ss(sp_params.sciphy_edit_probs);
+				std::string tok;
+				while (std::getline(ss, tok, ',')) {
+					edit_probs.push_back(convert_double(tok.c_str()));
+				}
+				if ((int)edit_probs.size() != M) {
+					outError("--edit-probs must have "
+						+ convertIntToString(M)
+						+ " comma-separated values (one per scar type)");
+				}
+			} else {
+				edit_probs.assign((size_t)M, 1.0 / (double)M);
+			}
+
+			// --origin-time is the known experiment duration. Default 1.0
+			// with a warning; supply the real value for correct inference.
+			double origin_time = sp_params.sciphy_origin_time;
+			if (origin_time <= 0.0) {
+				origin_time = 1.0;
+				outWarning("--origin-time not set; using default 1.0. "
+					"Supply the known experiment duration for correct "
+					"SciPhy inference.");
+			}
+
+			ModelSciPhy *sciphy_model = new ModelSciPhy(tree, edit_probs, origin_time);
+			// --clock-rate: set initial value and lock it out of Brent
+			// optimization. Used to reproduce BEAST/SciPhy reference LL
+			// under fixed model parameters.
+			//
+			// Guard is strictly > 0.0 (not >= 0.0): a clock rate of exactly 0
+			// makes every branch distance clock*length == 0, so the only
+			// non-zero transition is "no edit" and every edited tape is floored
+			// to ~1e-300 -- a degenerate likelihood independent of the tree.
+			// The Params singleton is zero-initialized, so an unset
+			// sciphy_clock_rate can arrive as 0.0; treating that as "user fixed
+			// the clock at 0" silently collapses the model. Only a positive
+			// value is a real user request to fix the clock; anything else
+			// (0.0 or the -1.0 sentinel) leaves the clock to be estimated.
+			if (sp_params.sciphy_clock_rate > 0.0) {
+				sciphy_model->fixClockRate(sp_params.sciphy_clock_rate);
+			}
+			model = sciphy_model;
+		} else {
+			model = new ModelMorphology(model_str.c_str(), model_params, freq_type, freq_params, tree);
+		}
 	} else {
 		outError("Unsupported model type");
 	}

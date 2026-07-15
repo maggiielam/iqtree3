@@ -2156,6 +2156,31 @@ void parseArg(int argc, char *argv[], Params &params) {
                 params.seed_specified = true;
 				continue;
 			}
+			// SciPhy-specific flags. Values are consumed by
+			// createModel() when the alignment is a BarcodeAlignment.
+			if (strcmp(argv[cnt], "--origin-time") == 0) {
+				cnt++;
+				if (cnt >= argc)
+					throw "Use --origin-time <total_experiment_duration>";
+				params.sciphy_origin_time = convert_double(argv[cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "--edit-probs") == 0) {
+				cnt++;
+				if (cnt >= argc)
+					throw "Use --edit-probs <p1,p2,...,pM>";
+				params.sciphy_edit_probs = argv[cnt];
+				continue;
+			}
+			if (strcmp(argv[cnt], "--clock-rate") == 0) {
+				cnt++;
+				if (cnt >= argc)
+					throw "Use --clock-rate <value>";
+				params.sciphy_clock_rate = convert_double(argv[cnt]);
+				if (params.sciphy_clock_rate < 0.0)
+					throw "--clock-rate must be non-negative";
+				continue;
+			}
 			if (strcmp(argv[cnt], "-pdgain") == 0) {
 				params.calc_pdgain = true;
 				continue;
@@ -6692,6 +6717,7 @@ InputType detectInputFile(const char *input_file) {
             case '(': return IN_NEWICK;
             case '[': return IN_NEWICK;
             case '>': return IN_FASTA;
+            case '<': return IN_CSV; // Barcode XML lineage format starts with XML tags
             case 'C': if (ch2 == 'L') return IN_CLUSTAL;
                       else if (ch2 == 'O') return IN_COUNTS;
                       else return IN_OTHER;
@@ -7520,6 +7546,11 @@ Params& Params::getInstance() {
 }
 
 void Params::setDefault() {
+    // SciPhy: user-supplied known values. Defaults mean "not set".
+    sciphy_origin_time = -1.0;
+    sciphy_edit_probs  = "";
+    sciphy_clock_rate  = -1.0;
+
     tree_gen = NONE;
     user_file = NULL;
     constraint_tree_file = NULL;

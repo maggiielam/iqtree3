@@ -44,6 +44,8 @@ phylotree.cpp
 phylotree.h
 phylotreemixlen.cpp
 phylotreemixlen.h
+phylotreesciphy.cpp
+phylotreesciphy.h
 phylotreepars.cpp
 phylotreesse.cpp
 quartet.cpp

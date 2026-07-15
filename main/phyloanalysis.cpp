@@ -32,11 +32,13 @@
 #include "phyloanalysis.h"
 #include "alignment/alignment.h"
 #include "alignment/superalignment.h"
+#include "alignment/barcodealignment.h"
 #include "alignment/superalignmentunlinked.h"
 #include "tree/iqtree.h"
 #include "tree/iqtreemix.h"
 #include "tree/iqtreemixhmm.h"
 #include "tree/phylotreemixlen.h"
+#include "tree/phylotreesciphy.h"
 #include "model/modelmarkov.h"
 #include "model/modeldna.h"
 #include "model/modelpomo.h"
@@ -4935,8 +4937,11 @@ IQTree *newIQTree(Params &params, Alignment *alignment) {
             tree = new PhyloTreeMixlen(alignment, 0);
         } else if (isTreeMix) {
             tree = new IQTreeMixHmm(params, alignment);
-        } else
+        } else if (dynamic_cast<BarcodeAlignment*>(alignment)) {
+            tree = new PhyloTreeSciPhy(alignment);
+        } else {
             tree = new IQTree(alignment);
+        }
     }
 
     return tree;

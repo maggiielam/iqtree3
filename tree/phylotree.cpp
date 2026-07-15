@@ -5909,6 +5909,13 @@ void PhyloTree::convertToRooted() {
         dad = node1->highestNei->node;
         node_len = longest - curlen;
         dad_len = node1->highestNei->length - node_len;
+        // Floating-point round-off in the walk loop above can produce a
+        // slightly-negative dad_len (e.g. -1e-15) even though in exact
+        // arithmetic the loop-exit condition guarantees dad_len >= 0.
+        // Clamp to 0 for numerical safety; only bail if it's meaningfully
+        // negative.
+        if (dad_len < 0.0 && dad_len > -1e-9) dad_len = 0.0;
+        if (node_len < 0.0 && node_len > -1e-9) node_len = 0.0;
         ASSERT(dad_len >= 0.0);
         /*
         // place root to the longest branch

@@ -1251,6 +1251,19 @@ void Alignment::extractSequences(char *filename, char *sequence_type, StrVector 
 	determine if the pattern is constant. update the is_const variable.
 */
 void Alignment::computeConst(Pattern &pat) {
+    // SciPhy-style barcode alignments can have num_states in the thousands
+    // (one state per unique tape vector). StateBitset is bitset<NUM_CHAR>
+    // with NUM_CHAR = 256, so setting state_app[j] for j >= 256 would be an
+    // out-of-bounds write and abort the process. The metadata computed
+    // here (const_char, is_invariant, is_informative) is used by +I / +I+G
+    // rate models and constant-site reporting -- none of which apply to
+    // SciPhy's matrix-free Poisson kernel. Bail out with just the safe
+    // default const_char value so the alignment reader can proceed.
+    if (num_states > NUM_CHAR) {
+        pat.const_char = STATE_UNKNOWN + 1;
+        return;
+    }
+
     bool is_const = true;
     bool is_invariant = false;
     bool is_informative = false;

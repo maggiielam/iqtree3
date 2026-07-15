@@ -1842,6 +1842,31 @@ public:
     /** maximum branch length for optimization, default 100 */
     double max_branch_length;
 
+    /**
+     * SciPhy: total experiment duration (origin_time) supplied by the user
+     * via --origin-time. -1.0 means "not set" -- a warning is issued and a
+     * placeholder default is used, which will bias the ML estimate.
+     */
+    double sciphy_origin_time;
+
+    /**
+     * SciPhy: comma-separated edit_probs supplied by the user via
+     * --edit-probs, e.g. "0.1,0.1,0.1,...". Empty means "not set" -- the
+     * model defaults to a uniform 1/M distribution over the M scar types
+     * observed in the alignment.
+     */
+    string sciphy_edit_probs;
+
+    /**
+     * SciPhy: clock rate supplied by the user via --clock-rate. -1.0 means
+     * "not set" -- the model uses its default initial value and Brent
+     * optimizes it. When set (any value >= 0), the clock rate is fixed
+     * to this value and Brent is skipped. Useful for evaluating the
+     * likelihood on a fixed tree with fixed model parameters against a
+     * ground-truth reference such as BEAST/SciPhy.
+     */
+    double sciphy_clock_rate;
+
     /** optimize the parameters according to the HMM model (HMMSTER) */
     bool optimize_params_use_hmm;
 
