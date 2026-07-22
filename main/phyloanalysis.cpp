@@ -3755,6 +3755,10 @@ void runTreeReconstruction(Params &params, IQTree* &iqtree) {
         if (iqtree->isSuperTreeUnlinked()) {
             params.compute_ml_dist = false;
         }
+        // SciPhy barcode data: Skip computing pairwise ML distances and just start tree search from the parsimony tree + parsimony candidates
+        if (dynamic_cast<BarcodeAlignment*>(iqtree->aln)) {
+            params.compute_ml_dist = false;
+        }
         //Todo: Check: is it always true that we've done this, if we reach this line?
         cout << "Wrote distance file to... " << iqtree->getDistanceFileWritten() << endl;
     }

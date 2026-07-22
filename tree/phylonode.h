@@ -13,6 +13,7 @@
 #define PHYLONODE_H
 
 #include "node.h"
+#include <vector>
 
 typedef unsigned short UBYTE;
 
@@ -20,6 +21,19 @@ typedef unsigned short UBYTE;
  * direction of a Neighbor from the root, for rooted tree only
  */
 enum RootDirection {UNDEFINED_DIRECTION, TOWARD_ROOT, AWAYFROM_ROOT};
+
+/**
+ * Per-directed-edge cached partials for the SciPhy likelihood.
+ * 
+ * ancestors[i] is a possible tape state at this node and `partial_lh[i]` its
+ * conditional likelihood; the true value is partial_lh[i] * exp(log_scale)
+ * (log_scale keeps the stored partials O(1) to avoid underflow on deep trees).
+ */
+struct SciPhyAncestorPartials {
+    std::vector<std::vector<int>> ancestors;
+    std::vector<double> partial_lh;
+    double log_scale = 0.0;
+};
 
 /**
 A neighbor in a phylogenetic tree
@@ -30,6 +44,7 @@ class PhyloNeighbor : public Neighbor {
     friend class PhyloNode;
     friend class PhyloTree;
     friend class IQTree;
+    friend class PhyloTreeSciPhy;   // SciPhy caches sciphy_partial per directed edge
     friend class PhyloSuperTree;
     friend class PhyloTreeMixlen;
     friend class MemSlotVector;
@@ -52,6 +67,7 @@ public:
         partial_pars = NULL;
         direction = UNDEFINED_DIRECTION;
         size = 0;
+        sciphy_partial = NULL;
     }
 
     /**
@@ -68,6 +84,7 @@ public:
         partial_pars = NULL;
         direction = UNDEFINED_DIRECTION;
         size = 0;
+        sciphy_partial = NULL;
     }
 
     /**
@@ -82,9 +99,18 @@ public:
         partial_pars = NULL;
         direction = nei->direction;
         size = nei->size;
+        sciphy_partial = NULL;
     }
 
-    
+    /**
+     free the SciPhy partial cache (null for every non-SciPhy neighbor).
+     Neighbor has a virtual destructor, so this runs on delete via Neighbor*.
+     */
+    virtual ~PhyloNeighbor() {
+        delete sciphy_partial;
+    }
+
+
     /**
      allocate a new Neighbor by just copying from this one
      @return pointer to newly created Neighbor
@@ -158,6 +184,12 @@ private:
         vector containing the partial likelihoods
      */
     double *partial_lh;
+
+    /**
+        cache: one SciPhyAncestorPartials per alignment
+        pattern for the subtree on the far side of this directed edge.
+     */
+    std::vector<SciPhyAncestorPartials> *sciphy_partial;
 
     /**
         likelihood scaling factor
