@@ -31,24 +31,61 @@ ModelSciPhy::ModelSciPhy(PhyloTree *tree,
     // just for printing info about the model, not used for likelihood calculations
     freq_type = FREQ_EQUAL;
 
-    // Populate the inherited rate_matrix and state_freq with Mk-style defaults. 
-    // SciPhy itself doesn't use these but the base-class matrix machinery (used during the initial pairwise ML-distance
-    // computation for BIONJ, and by writeInfo / reportModel) reads them
-    // TODO: check how initial trees are being constructed, if it would be cleaner to just not use BIONJ
-    if (num_states > 1) {
-        // rate_matrix is num_states*num_states, stored row-major.
-        const double off_diag = 1.0 / (double)(num_states - 1);
-        for (int i = 0; i < num_states; ++i) {
-            double *row = rate_matrix + (size_t)i * num_states;
-            for (int j = 0; j < num_states; ++j) {
-                row[j] = (i == j) ? -1.0 : off_diag;
-            }
-        }
-        // uniform equilibrium frequencies
-        for (int i = 0; i < num_states; ++i) {
-            state_freq[i] = 1.0 / (double)num_states;
-        }
+    // Free ModelMarkov's S x S rate_matrix / rates (S = #tape vectors; unused, GBs on
+    // real data). aligned_free nulls the pointer, so no double free.
+    aligned_free(rate_matrix);
+    delete[] rates;
+    rates = nullptr;
+
+    // uniform equilibrium frequencies (O(S); only printed, never used in the likelihood)
+    for (int i = 0; i < num_states; ++i) {
+        state_freq[i] = 1.0 / (double)num_states;
     }
+}
+
+// <----- dense-matrix machinery: not available for SciPhy ----->
+
+uint64_t ModelSciPhy::getMemoryRequired() {
+    // state_freq (S doubles) + edit probabilities; no S x S storage.
+    return ModelSubst::getMemoryRequired() + edit_probs.size() * sizeof(double);
+}
+
+namespace {
+[[noreturn]] void sciphyNoDenseMatrix(const char *what) {
+    outError(std::string("SciPhy model has no dense rate/transition matrix (") + what +
+             "). Transition probabilities are computed in closed form by PhyloTreeSciPhy; "
+             "this option is not supported for barcode data.");
+    throw std::runtime_error(what);   // outError exits; keeps [[noreturn]] honest
+}
+}
+
+void ModelSciPhy::getRateMatrix(double *) { sciphyNoDenseMatrix("getRateMatrix"); }
+void ModelSciPhy::getQMatrix(double *, int) { sciphyNoDenseMatrix("getQMatrix"); }
+void ModelSciPhy::computeTransMatrix(double, double *, int, int) { sciphyNoDenseMatrix("computeTransMatrix"); }
+void ModelSciPhy::computeTransMatrixNonrev(double, double *, int) { sciphyNoDenseMatrix("computeTransMatrixNonrev"); }
+void ModelSciPhy::computeTransDerv(double, double *, double *, double *, int) { sciphyNoDenseMatrix("computeTransDerv"); }
+void ModelSciPhy::setRateMatrix(double *) { sciphyNoDenseMatrix("setRateMatrix"); }
+void ModelSciPhy::setFullRateMatrix(double *, double *) { sciphyNoDenseMatrix("setFullRateMatrix"); }
+void ModelSciPhy::readRates(string) noexcept(false) { sciphyNoDenseMatrix("readRates"); }
+
+bool ModelSciPhy::isUnstableParameters() {
+    // no rate entries; the clock is bounded in optimizeParameters
+    return false;
+}
+
+void ModelSciPhy::adaptStateFrequency(double *freq) {
+    ModelSubst::setStateFrequency(freq);       // no rates[] to rescale
+}
+
+void ModelSciPhy::setVariables(double *variables) {
+    if (getNDim() > 0) variables[1] = clock_rate;
+}
+
+bool ModelSciPhy::getVariables(double *variables) {
+    if (getNDim() <= 0) return false;
+    const bool changed = (variables[1] != clock_rate);
+    clock_rate = variables[1];
+    return changed;
 }
 
 ModelSciPhy::~ModelSciPhy() {}
@@ -88,13 +125,14 @@ void ModelSciPhy::writeInfo(ostream &out) {
     out << "  clock rate:  " << clock_rate
         << (clock_rate_fixed ? "  (fixed)" : "  (estimated)") << endl;
     out << "  origin time: " << origin_time << "  (fixed by user)" << endl;
+    out << "  dropout prob (q): ";
+    if (hasDropoutProb()) out << dropout_prob << "  (tip weights q / 1-q)" << endl;
+    else                  out << "not set  (dropped tapes weighted 1)" << endl;
 }
 
 void ModelSciPhy::writeParameters(ostream &out) {
     out << clock_rate;
 }
-
-// readRates — unsupported, TODO: add support for this?
 
 void ModelSciPhy::readRates(istream &in) noexcept(false) {
     throw std::runtime_error(

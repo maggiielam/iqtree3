@@ -17,8 +17,6 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <map>
-#include <set>
 
 PhyloTreeSciPhy::PhyloTreeSciPhy() : IQTree() {}
 
@@ -51,122 +49,89 @@ double poissonPMF(int k, double mean) {
     return std::exp(log_p);
 }
 
-double maxDistToLeafHelper(Node *node, Node *parent) {
-    if (node->isLeaf()) return 0.0;
-    double max_dist = 0.0;
-    FOR_NEIGHBOR_IT(node, parent, it) {
-        double child_dist = maxDistToLeafHelper((*it)->node, node) + (*it)->length;
-        if (child_dist > max_dist) max_dist = child_dist;
-    }
-    return max_dist;
+// log Poisson PMF; stays finite where poissonPMF would underflow to 0.
+double logPoissonPMF(int k, double mean) {
+    const double NEG_INF = -std::numeric_limits<double>::infinity();
+    if (k < 0 || mean < 0.0) return NEG_INF;
+    if (mean == 0.0) return (k == 0) ? 0.0 : NEG_INF;
+    return (double)k * std::log(mean) - mean - std::lgamma((double)k + 1.0);
+}
+
+// Numerically stable log(exp(a) + exp(b)).
+double logAdd(double a, double b) {
+    const double NEG_INF = -std::numeric_limits<double>::infinity();
+    if (a == NEG_INF) return b;
+    if (b == NEG_INF) return a;
+    const double hi = (a > b) ? a : b;
+    const double lo = (a > b) ? b : a;
+    return hi + std::log1p(std::exp(lo - hi));
 }
 }  // anonymous namespace
 
-double PhyloTreeSciPhy::sciphyTreeHeight() const {
-    if (!rooted || !root) return 0.0;
-    if (root->neighbors.empty()) return 0.0;
-    Node *root_int = root->neighbors[0]->node;
-    return maxDistToLeafHelper(root_int, root);
-}
-
-void PhyloTreeSciPhy::syncOriginBranchLength() {
-    if (!rooted || !root || root->neighbors.empty()) return;
+// log P(parent tape -> child tape) over branch_length; -inf if impossible.
+double PhyloTreeSciPhy::logTransProbVec(const std::vector<int> &parent,
+                                        const std::vector<int> &child,
+                                        double branch_length) const {
+    const double NEG_INF = -std::numeric_limits<double>::infinity();
 
     const ModelSciPhy *sm = dynamic_cast<const ModelSciPhy*>(model);
-    if (!sm) return;
-    const double lambda = sm->getClockRate();
-
-    double slack = std::max(0.0, sm->getOriginTime() - sciphyTreeHeight());
-
-    PhyloNeighbor *edge0 = (PhyloNeighbor*) root->neighbors[0];
-    if (!edge0) return;
-    edge0->length = slack;
-
-    PhyloNeighbor *edge0_back = (PhyloNeighbor*) edge0->node->findNeighbor(root);
-    if (edge0_back) edge0_back->length = slack;
-}
-
-double PhyloTreeSciPhy::transProbVec(const std::vector<int> &parent,
-                                     const std::vector<int> &child,
-                                     double branch_length) const {
-    // SciPhySubstitutionModel.getSequenceTransitionProbability
-    // formula:
-    //   - the whole tape accumulates edits as a single Poisson process whose
-    //     mean over this branch is `distance` (= sciphy_lambda * branch_length);
-    //   - edits fill the leftmost unedited slot in order;
-    //   - each new edit independently picks a scar type from `editProbs`
-    //     (uniform 1/M here as a placeholder for a future free distribution).
-
-    const ModelSciPhy *sm = dynamic_cast<const ModelSciPhy*>(model);
-    if (!sm) return 0.0;
+    if (!sm) return NEG_INF;
     const double lambda = sm->getClockRate();
     const auto &edit_probs = sm->getEditProbs();
 
-
     const BarcodeAlignment *barcode_aln = dynamic_cast<const BarcodeAlignment*>(aln);
-    if (!barcode_aln) {
-        return 0.0;
-    }
-    if (parent.size() != child.size() || parent.empty()) {
-        return 0.0;
-    }
+    if (!barcode_aln) return NEG_INF;
+    if (parent.size() != child.size() || parent.empty()) return NEG_INF;
 
     const int L = (int)parent.size();
     const int M = std::max(1, barcode_aln->getMaxInsertionType());
 
-    // Extract the non-zero scars from each tape, in left-to-right order.
-    std::vector<int> parent_scars;
-    std::vector<int> child_scars;
+    std::vector<int> parent_scars, child_scars;
     parent_scars.reserve((size_t)L);
     child_scars.reserve((size_t)L);
     for (int x : parent) if (x != 0) parent_scars.push_back(x);
     for (int x : child)  if (x != 0) child_scars.push_back(x);
 
-    // parent must carry no more edits than child.
-    if (parent_scars.size() > child_scars.size()) return 0.0;
+    if (parent_scars.size() > child_scars.size()) return NEG_INF;
 
     std::vector<int> new_inserts = child_scars;
     for (int p_scar : parent_scars) {
         auto it = std::find(new_inserts.begin(), new_inserts.end(), p_scar);
-        if (it == new_inserts.end()) {
-            return 0.0;
-        }
+        if (it == new_inserts.end()) return NEG_INF;
         new_inserts.erase(it);
     }
 
     const int nr_possible = L - (int)parent_scars.size();
     const int k = (int)new_inserts.size();
-    if (k > nr_possible) return 0.0;  // logically unreachable, defensive.
+    if (k > nr_possible) return NEG_INF;
 
-    // Scar-type factor.  Use the model's edit_probs when available (populated from --edit-probs or defaulted to uniform 1/M by ModelFactory).  
+    // Scar-type factor, in log space.
     const double per_scar_uniform = 1.0 / (double)M;
     const int n_edit_probs = (int)edit_probs.size();
-    double insert_factor = 1.0;
+    double log_insert = 0.0;
     for (int scar : new_inserts) {
-        if (scar < 1 || scar > M) return 0.0;
-        insert_factor *= (scar - 1 < n_edit_probs)
-                          ? edit_probs[scar - 1]
-                          : per_scar_uniform;
+        if (scar < 1 || scar > M) return NEG_INF;
+        const double pe = (scar - 1 < n_edit_probs) ? edit_probs[scar - 1] : per_scar_uniform;
+        if (!(pe > 0.0)) return NEG_INF;
+        log_insert += std::log(pe);
     }
 
     const double distance = std::max(0.0, lambda * branch_length);
 
     if (k == nr_possible) {
-        // Absorbing case: tape is now fully edited.  Probability is the tail mass P(>= nr_possible events) under Poisson(distance).
-        double absorb_prob = 1.0;
-        for (int i = 0; i < nr_possible; ++i) {
-            absorb_prob -= poissonPMF(i, distance);
-        }
-        if (absorb_prob < 0.0) absorb_prob = 0.0;
-        return absorb_prob * insert_factor;
+        // Absorbing tail P(K >= nr_possible) under Poisson(distance).
+        double tail = 1.0;
+        for (int i = 0; i < nr_possible; ++i) tail -= poissonPMF(i, distance);
+        if (tail > 0.0) return std::log(tail) + log_insert;
+        // tail underflowed: use its leading term P(K = nr_possible)
+        return logPoissonPMF(nr_possible, distance) + log_insert;
     }
-    return poissonPMF(k, distance) * insert_factor;
+    return logPoissonPMF(k, distance) + log_insert;
 }
 
 std::vector<std::vector<int>>
 PhyloTreeSciPhy::getPossibleAncestors(const std::vector<int> &tape_vec) {
-    // Walk the tape from right to left, clearing edits one at a time.  
-    // Every partial sequence we visit is a valid ancestral state.
+    // clear edits right to left; every prefix visited is a possible ancestor
     std::vector<std::vector<int>> ancestors;
     if (tape_vec.empty()) {
         return ancestors;
@@ -184,7 +149,7 @@ PhyloTreeSciPhy::getPossibleAncestors(const std::vector<int> &tape_vec) {
 
 namespace {
 
-// Vector intersection that preserves the order of `a` and removes any element not present in `b`. 
+// elements of `a` also in `b`, in the order of `a`
 std::vector<std::vector<int>> intersectAncestorLists(
         const std::vector<std::vector<int>> &a,
         const std::vector<std::vector<int>> &b) {
@@ -201,17 +166,21 @@ std::vector<std::vector<int>> intersectAncestorLists(
     return out;
 }
 
+// log(sum_i partial_lh[i]) + log_scale (just log_scale for a wildcard partial)
+double totalLogMass(const SciPhyAncestorPartials &v) {
+    const double NEG_INF = -std::numeric_limits<double>::infinity();
+    if (v.wildcard) return v.log_scale;
+    double s = 0.0;
+    for (double x : v.partial_lh) if (x > 0.0) s += x;
+    return (s > 0.0) ? (std::log(s) + v.log_scale) : NEG_INF;
+}
+
 }  // anonymous namespace
 
-// <----- Partial Likelihood caching implementation ----->
+// <----- Partial likelihood caching ----->
 
-
-/**
- * Compute downward partial likelihoods, caching them in each PhyloNeighbor's sciphy_partial vector.
- * Recursive post-order traversal of the tree.
- */
+// Post-order: cache Down(subtree) on dad_branch->sciphy_partial.
 void PhyloTreeSciPhy::computeSciPhyDownward(PhyloNeighbor *dad_branch, PhyloNode *dad) {
-    // Cache hit: partial lh bit is 1, so it is valid
     if (dad_branch->partial_lh_computed & 1) {
         return;
     }
@@ -232,18 +201,23 @@ void PhyloTreeSciPhy::computeSciPhyDownward(PhyloNeighbor *dad_branch, PhyloNode
     }
 
     if (node->isLeaf()) {
+        // Dropout tip weights (constants): dropped -> q, observed -> 1-q; 1 if q unset.
+        const ModelSciPhy *sm_leaf = dynamic_cast<const ModelSciPhy*>(model);
+        const bool use_q = sm_leaf && sm_leaf->hasDropoutProb();
+        const double log_q     = use_q ? std::log(sm_leaf->getDropoutProb()) : 0.0;
+        const double log_1mq   = use_q ? std::log(1.0 - sm_leaf->getDropoutProb()) : 0.0;
+
         for (size_t ptn = 0; ptn < nptn; ++ptn) {
             SciPhyAncestorPartials &result = out[ptn];
 
-            // observed tape on leaf node; all probability on the observed value (idx 0 of ancestors).
             const int obs = getObservedLeafState(node, ptn);
-            if (obs < 0 || obs >= barcode_aln->getNumTapeStates()) {
-                // defensive fallback for unknown/ambiguous leaf
-                int site_count = 0;
-                const auto &tsc = barcode_aln->getTapeSiteCounts();
-                if (!tsc.empty()) site_count = tsc[0];
-                result.ancestors.emplace_back((size_t)site_count, 0);
-                result.partial_lh.push_back(1.0);
+            if (obs == aln->STATE_UNKNOWN || obs < 0 ||
+                obs >= barcode_aln->getNumTapeStates()) {
+                // dropped tape: wildcard (present, identity unknown)
+                result.wildcard = true;
+                result.ancestors.clear();
+                result.partial_lh.clear();
+                result.log_scale = log_q;
                 continue;
             }
             const std::vector<int> &leaf_tape = barcode_aln->getTapeVec(obs);
@@ -252,13 +226,13 @@ void PhyloTreeSciPhy::computeSciPhyDownward(PhyloNeighbor *dad_branch, PhyloNode
             if (!result.partial_lh.empty()) {
                 result.partial_lh[0] = 1.0;
             }
+            result.log_scale = log_1mq;
         }
         dad_branch->partial_lh_computed |= 1;
         return;
     }
 
-    // Internal node: gather child neighbors (everything except the edge back
-    // toward `dad`) and compute their (cached) downward partials first.
+    // internal node: compute children first
     std::vector<PhyloNeighbor*> child_nei;
     for (NeighborVec::iterator nit = node->neighbors.begin();
          nit != node->neighbors.end(); ++nit) {
@@ -273,64 +247,89 @@ void PhyloTreeSciPhy::computeSciPhyDownward(PhyloNeighbor *dad_branch, PhyloNode
         return;
     }
 
-    // Combine per pattern, parallelizable because tapes evolve independently.
-    // (children are already computed serially above; each iteration writes a
-    // distinct out[p] and only reads children's cached partials).
+    // patterns (tapes) are independent
 #pragma omp parallel for schedule(dynamic) num_threads(num_threads) if (num_threads > 1)
     for (int p = 0; p < (int)nptn; ++p) {
         SciPhyAncestorPartials &result = out[p];
 
-        // ancestors = intersection of children's ancestor lists
-        result.ancestors = (*child_nei[0]->sciphy_partial)[p].ancestors;
-        for (size_t k = 1; k < child_nei.size(); ++k) {
+        // wildcard children don't constrain the ancestor set; they add only a constant
+        std::vector<PhyloNeighbor*> obs_nei;
+        double wild_scale = 0.0;
+        for (size_t k = 0; k < child_nei.size(); ++k) {
+            const SciPhyAncestorPartials &cp = (*child_nei[k]->sciphy_partial)[p];
+            if (cp.wildcard) wild_scale += cp.log_scale;
+            else             obs_nei.push_back(child_nei[k]);
+        }
+
+        // all children missing this tape -> wildcard
+        if (obs_nei.empty()) {
+            result.wildcard = true;
+            result.ancestors.clear();
+            result.partial_lh.clear();
+            result.log_scale = wild_scale;
+            continue;
+        }
+
+        // possible states = intersection of the observed children's ancestor lists
+        result.ancestors = (*obs_nei[0]->sciphy_partial)[p].ancestors;
+        for (size_t k = 1; k < obs_nei.size(); ++k) {
             result.ancestors = intersectAncestorLists(
-                result.ancestors, (*child_nei[k]->sciphy_partial)[p].ancestors);
+                result.ancestors, (*obs_nei[k]->sciphy_partial)[p].ancestors);
             if (result.ancestors.empty()) break;
         }
-        result.partial_lh.assign(result.ancestors.size(), 0.0); // initialize vector of partial likelihoods size to number of ancestors, vals to 0
+        result.partial_lh.assign(result.ancestors.size(), 0.0);
 
-        // Felsentein's pruning algorithm without probability matrix
-        // partial_lh[s] = prod_child sum_c transProbVec(s,c,t_c) * child_lh[c]
+        // Pruning in log space:
+        //   log partial_lh[s] = sum_child logsumexp_c( logTrans(s -> c, t_c) + log child_lh[c] )
+        // stored relative to its max; the rest goes into log_scale.
+        const double NEG_INF = -std::numeric_limits<double>::infinity();
+        double base_scale = wild_scale;
+        for (size_t k = 0; k < obs_nei.size(); ++k)
+            base_scale += (*obs_nei[k]->sciphy_partial)[p].log_scale;
+
+        std::vector<std::vector<double>> log_cp(obs_nei.size());
+        for (size_t k = 0; k < obs_nei.size(); ++k) {
+            const SciPhyAncestorPartials &cd = (*obs_nei[k]->sciphy_partial)[p];
+            log_cp[k].resize(cd.ancestors.size());
+            for (size_t c = 0; c < cd.ancestors.size(); ++c)
+                log_cp[k][c] = (cd.partial_lh[c] > 0.0) ? std::log(cd.partial_lh[c]) : NEG_INF;
+        }
+
+        std::vector<double> log_rel(result.ancestors.size(), NEG_INF);
+        double max_log_rel = NEG_INF;
         for (size_t s_idx = 0; s_idx < result.ancestors.size(); ++s_idx) {
-            const std::vector<int> &s_vec = result.ancestors[s_idx]; // for each ancestor tape state s
-            double lh_s = 1.0;
-            for (size_t k = 0; k < child_nei.size(); ++k) {
-                const SciPhyAncestorPartials &cd = (*child_nei[k]->sciphy_partial)[p];
-                const double blen = child_nei[k]->length;
-                double sum_child = 0.0;
-                for (size_t c_idx = 0; c_idx < cd.ancestors.size(); ++c_idx) { // for each ancestor tape
-                    if (cd.partial_lh[c_idx] <= 0.0) continue;
-                    const double tr = transProbVec(s_vec, cd.ancestors[c_idx], blen);
-                    if (tr > 0.0) sum_child += tr * cd.partial_lh[c_idx];
+            const std::vector<int> &s_vec = result.ancestors[s_idx];
+            double log_lh_s = 0.0;
+            for (size_t k = 0; k < obs_nei.size(); ++k) {
+                const SciPhyAncestorPartials &cd = (*obs_nei[k]->sciphy_partial)[p];
+                const double blen = obs_nei[k]->length;
+                double child_lse = NEG_INF;
+                for (size_t c_idx = 0; c_idx < cd.ancestors.size(); ++c_idx) {
+                    if (log_cp[k][c_idx] == NEG_INF) continue;
+                    const double lt = logTransProbVec(s_vec, cd.ancestors[c_idx], blen);
+                    if (lt == NEG_INF) continue;
+                    child_lse = logAdd(child_lse, lt + log_cp[k][c_idx]);
                 }
-                lh_s *= sum_child;
-                if (lh_s <= 0.0) break;
+                log_lh_s += child_lse;
+                if (log_lh_s == NEG_INF) break;
             }
-            result.partial_lh[s_idx] = lh_s;
+            log_rel[s_idx] = log_lh_s;
+            if (log_lh_s > max_log_rel) max_log_rel = log_lh_s;
         }
 
-        // numerical scaling: log_scale = sum of children's, plus log(max) after
-        // factoring the largest partial out so stored values stay O(1).
-        double ls = 0.0;
-        for (size_t k = 0; k < child_nei.size(); ++k) {
-            ls += (*child_nei[k]->sciphy_partial)[p].log_scale;
+        if (max_log_rel == NEG_INF) {
+            result.log_scale = NEG_INF;   // no possible ancestral state
+        } else {
+            for (size_t s_idx = 0; s_idx < result.ancestors.size(); ++s_idx)
+                result.partial_lh[s_idx] = std::exp(log_rel[s_idx] - max_log_rel);
+            result.log_scale = base_scale + max_log_rel;
         }
-        double max_partial = 0.0;
-        for (double v : result.partial_lh) if (v > max_partial) max_partial = v;
-        if (max_partial > 0.0) {
-            for (double &v : result.partial_lh) v /= max_partial;
-            ls += std::log(max_partial);
-        }
-        result.log_scale = ls;
     }
 
     dad_branch->partial_lh_computed |= 1;
 }
 
-/**
- * Compute upward partial likelihoods, caching them in each PhyloNeighbor's sciphy_partial vector.
- * Recursive pre-order traversal of the tree.
- */
+// Pre-order: cache UpToC(node) on each (child -> node) half-edge below `node`.
 void PhyloTreeSciPhy::computeSciPhyUpward(PhyloNode *node, PhyloNode *dad) {
     const BarcodeAlignment *barcode_aln = dynamic_cast<const BarcodeAlignment*>(aln);
     if (!barcode_aln) return;
@@ -345,29 +344,51 @@ void PhyloTreeSciPhy::computeSciPhyUpward(PhyloNode *node, PhyloNode *dad) {
     const std::vector<SciPhyAncestorPartials> &downNode = *down_nei->sciphy_partial;
     const double len_dad_node = down_nei->length;
 
-    // UpBar(node)[s_node] = sum_{s_dad} UpToC(dad)[s_dad] * trans(s_dad -> s_node,
-    //                       len(dad,node)), restricted to Down(node)'s support.
+    // UpBar(node)[s] = sum_{s_dad} UpToC(dad)[s_dad] * trans(s_dad -> s), s in Down(node)'s support
+    const double NEG_INF = -std::numeric_limits<double>::infinity();
     std::vector<SciPhyAncestorPartials> upBar(nptn);
     for (size_t p = 0; p < nptn; ++p) {
         const SciPhyAncestorPartials &ud = upToDad[p];
         const SciPhyAncestorPartials &dn = downNode[p];
         SciPhyAncestorPartials &ub = upBar[p];
+
+        // all-missing subtree or uninformative up side: collapses to the total up mass
+        if (dn.wildcard || ud.wildcard) {
+            ub.wildcard = true;
+            ub.ancestors.clear();
+            ub.partial_lh.clear();
+            ub.log_scale = totalLogMass(ud);
+            continue;
+        }
+
         ub.ancestors = dn.ancestors;                        // indexed by s_node
         ub.partial_lh.assign(ub.ancestors.size(), 0.0);
+
+        std::vector<double> log_ud(ud.ancestors.size(), NEG_INF);
+        for (size_t j = 0; j < ud.ancestors.size(); ++j)
+            log_ud[j] = (ud.partial_lh[j] > 0.0) ? std::log(ud.partial_lh[j]) : NEG_INF;
+
+        std::vector<double> log_rel(ub.ancestors.size(), NEG_INF);
+        double max_log_rel = NEG_INF;
         for (size_t i = 0; i < ub.ancestors.size(); ++i) {
             const std::vector<int> &s_node = ub.ancestors[i];
-            double acc = 0.0;
+            double lse = NEG_INF;
             for (size_t j = 0; j < ud.ancestors.size(); ++j) {
-                if (ud.partial_lh[j] <= 0.0) continue;
-                const double tr = transProbVec(ud.ancestors[j], s_node, len_dad_node);
-                if (tr > 0.0) acc += ud.partial_lh[j] * tr;
+                if (log_ud[j] == NEG_INF) continue;
+                const double lt = logTransProbVec(ud.ancestors[j], s_node, len_dad_node);
+                if (lt == NEG_INF) continue;
+                lse = logAdd(lse, log_ud[j] + lt);
             }
-            ub.partial_lh[i] = acc;
+            log_rel[i] = lse;
+            if (lse > max_log_rel) max_log_rel = lse;
         }
-        double ls = ud.log_scale, mx = 0.0;
-        for (double v : ub.partial_lh) if (v > mx) mx = v;
-        if (mx > 0.0) { for (double &v : ub.partial_lh) v /= mx; ls += std::log(mx); }
-        ub.log_scale = ls;
+        if (max_log_rel == NEG_INF) {
+            ub.log_scale = NEG_INF;
+        } else {
+            for (size_t i = 0; i < ub.ancestors.size(); ++i)
+                ub.partial_lh[i] = std::exp(log_rel[i] - max_log_rel);
+            ub.log_scale = ud.log_scale + max_log_rel;
+        }
     }
 
     // children of node = all neighbors except dad
@@ -380,9 +401,8 @@ void PhyloTreeSciPhy::computeSciPhyUpward(PhyloNode *node, PhyloNode *dad) {
         }
     }
 
-    // For each child c: UpToC(node)[s_node] = UpBar(node)[s_node] * prod over
-    // siblings d (!= c) of ( sum_{s_d} trans(s_node -> s_d, len(node,d)) * Down(d)[s_d] );
-    // store on (c -> node), then recurse into c.
+    // UpToC(node) for child c = UpBar(node) * prod_{siblings d} sum_{s_d} trans * Down(d);
+    // stored on (c -> node), then recurse into c.
     for (size_t ci = 0; ci < childDown.size(); ++ci) {
         PhyloNeighbor *c_up = (PhyloNeighbor*) childNode[ci]->findNeighbor(node);
         if (!c_up->sciphy_partial) c_up->sciphy_partial = new std::vector<SciPhyAncestorPartials>();
@@ -390,74 +410,120 @@ void PhyloTreeSciPhy::computeSciPhyUpward(PhyloNode *node, PhyloNode *dad) {
         out.assign(nptn, SciPhyAncestorPartials());
         for (size_t p = 0; p < nptn; ++p) {
             SciPhyAncestorPartials &result = out[p];
-            result.ancestors  = upBar[p].ancestors;
-            result.partial_lh = upBar[p].partial_lh;
-            double ls = upBar[p].log_scale;
+
+            // constant UpBar -> constant UpToC (fold in sibling constants)
+            if (upBar[p].wildcard) {
+                double ls = upBar[p].log_scale;
+                for (size_t di = 0; di < childDown.size(); ++di) {
+                    if (di == ci) continue;
+                    ls += (*childDown[di]->sciphy_partial)[p].log_scale;
+                }
+                result.wildcard = true;
+                result.ancestors.clear();
+                result.partial_lh.clear();
+                result.log_scale = ls;
+                continue;
+            }
+
+            result.ancestors = upBar[p].ancestors;
+            result.partial_lh.assign(result.ancestors.size(), 0.0);
+
+            double base_scale = upBar[p].log_scale;
+            std::vector<double> log_rel(result.ancestors.size(), NEG_INF);
+            for (size_t i = 0; i < result.ancestors.size(); ++i)
+                log_rel[i] = (upBar[p].partial_lh[i] > 0.0) ? std::log(upBar[p].partial_lh[i]) : NEG_INF;
+
             for (size_t di = 0; di < childDown.size(); ++di) {
                 if (di == ci) continue;
                 const SciPhyAncestorPartials &dd = (*childDown[di]->sciphy_partial)[p];
+                if (dd.wildcard) { base_scale += dd.log_scale; continue; }
                 const double blen = childDown[di]->length;
+                std::vector<double> log_dd(dd.ancestors.size(), NEG_INF);
+                for (size_t j = 0; j < dd.ancestors.size(); ++j)
+                    log_dd[j] = (dd.partial_lh[j] > 0.0) ? std::log(dd.partial_lh[j]) : NEG_INF;
                 for (size_t i = 0; i < result.ancestors.size(); ++i) {
-                    if (result.partial_lh[i] <= 0.0) continue;
+                    if (log_rel[i] == NEG_INF) continue;
                     const std::vector<int> &s_node = result.ancestors[i];
-                    double sm = 0.0;
+                    double sm = NEG_INF;
                     for (size_t j = 0; j < dd.ancestors.size(); ++j) {
-                        if (dd.partial_lh[j] <= 0.0) continue;
-                        const double tr = transProbVec(s_node, dd.ancestors[j], blen);
-                        if (tr > 0.0) sm += tr * dd.partial_lh[j];
+                        if (log_dd[j] == NEG_INF) continue;
+                        const double lt = logTransProbVec(s_node, dd.ancestors[j], blen);
+                        if (lt == NEG_INF) continue;
+                        sm = logAdd(sm, lt + log_dd[j]);
                     }
-                    result.partial_lh[i] *= sm;
+                    log_rel[i] += sm;
                 }
-                ls += dd.log_scale;
+                base_scale += dd.log_scale;
             }
-            double mx = 0.0;
-            for (double v : result.partial_lh) if (v > mx) mx = v;
-            if (mx > 0.0) { for (double &v : result.partial_lh) v /= mx; ls += std::log(mx); }
-            result.log_scale = ls;
+
+            double max_log_rel = NEG_INF;
+            for (double v : log_rel) if (v > max_log_rel) max_log_rel = v;
+            if (max_log_rel == NEG_INF) {
+                result.log_scale = NEG_INF;
+            } else {
+                for (size_t i = 0; i < result.ancestors.size(); ++i)
+                    result.partial_lh[i] = std::exp(log_rel[i] - max_log_rel);
+                result.log_scale = base_scale + max_log_rel;
+            }
         }
         c_up->partial_lh_computed |= 1;
         computeSciPhyUpward(childNode[ci], node);
     }
 }
 
-/**
- * Combine upward and downward partial likelihoods at a branch, returning the log-likelihood contribution of that branch.
- */
+// Whole-tree logL from an up partial and a down partial joined by a branch of length len.
 double PhyloTreeSciPhy::combineVectors(const std::vector<SciPhyAncestorPartials> &up,
                                       const std::vector<SciPhyAncestorPartials> &down,
                                       double len) const {
     const size_t nptn = aln->getNPattern();
-    const double eps = 1e-300;
+    const double NEG_INF = -std::numeric_limits<double>::infinity();
     if (up.size() != nptn || down.size() != nptn) {
-        return -std::numeric_limits<double>::infinity();
+        return NEG_INF;
     }
     double tree_lh = 0.0;
     for (size_t p = 0; p < nptn; ++p) {
         const SciPhyAncestorPartials &dc = down[p];  // s_child
         const SciPhyAncestorPartials &uc = up[p];    // s_parent
-        double prob = 0.0;
-        for (size_t j = 0; j < uc.ancestors.size(); ++j) {
-            if (uc.partial_lh[j] <= 0.0) continue;
-            const std::vector<int> &s_par = uc.ancestors[j];
-            double s = 0.0;
-            for (size_t i = 0; i < dc.ancestors.size(); ++i) {
-                if (dc.partial_lh[i] <= 0.0) continue;
-                const double tr = transProbVec(s_par, dc.ancestors[i], len);
-                if (tr > 0.0) s += tr * dc.partial_lh[i];
+        // log P(pattern) = logsumexp_{s_par}[ log up[s_par]
+        //     + logsumexp_{s_child}( logTrans(s_par -> s_child, len) + log down[s_child] ) ] + scales
+        double lp;
+        if (uc.wildcard && dc.wildcard) {
+            lp = uc.log_scale + dc.log_scale;
+        } else if (dc.wildcard) {
+            // child side all missing: marginalize the up side
+            double lse = NEG_INF;
+            for (size_t j = 0; j < uc.partial_lh.size(); ++j)
+                if (uc.partial_lh[j] > 0.0) lse = logAdd(lse, std::log(uc.partial_lh[j]));
+            lp = (lse == NEG_INF) ? NEG_INF : lse + uc.log_scale + dc.log_scale;
+        } else if (uc.wildcard) {
+            // up side uninformative (normally not reached): marginalize the down side
+            double lse = NEG_INF;
+            for (size_t i = 0; i < dc.partial_lh.size(); ++i)
+                if (dc.partial_lh[i] > 0.0) lse = logAdd(lse, std::log(dc.partial_lh[i]));
+            lp = (lse == NEG_INF) ? NEG_INF : lse + uc.log_scale + dc.log_scale;
+        } else {
+            double lse_par = NEG_INF;
+            for (size_t j = 0; j < uc.ancestors.size(); ++j) {
+                if (uc.partial_lh[j] <= 0.0) continue;
+                const std::vector<int> &s_par = uc.ancestors[j];
+                double lse_child = NEG_INF;
+                for (size_t i = 0; i < dc.ancestors.size(); ++i) {
+                    if (dc.partial_lh[i] <= 0.0) continue;
+                    const double lt = logTransProbVec(s_par, dc.ancestors[i], len);
+                    if (lt == NEG_INF) continue;
+                    lse_child = logAdd(lse_child, lt + std::log(dc.partial_lh[i]));
+                }
+                if (lse_child == NEG_INF) continue;
+                lse_par = logAdd(lse_par, std::log(uc.partial_lh[j]) + lse_child);
             }
-            prob += uc.partial_lh[j] * s;
+            lp = (lse_par == NEG_INF) ? NEG_INF : lse_par + dc.log_scale + uc.log_scale;
         }
-        double lp = (prob > 0.0 && std::isfinite(prob))
-                        ? (std::log(prob) + dc.log_scale + uc.log_scale)
-                        : std::log(eps);
         tree_lh += lp * ptn_freq[p];
     }
     return tree_lh;
 }
 
-/**
- * Combine upward and downward partial likelihoods at a branch, returning the log-likelihood contribution of that branch.
- */
+// combineVectors at the edge (parent, child) using the cached snapshot partials.
 double PhyloTreeSciPhy::combineAtBranch(PhyloNode *parent, PhyloNode *child) {
     PhyloNeighbor *down_nei = (PhyloNeighbor*) parent->findNeighbor(child); // Down(child)
     PhyloNeighbor *up_nei   = (PhyloNeighbor*) child->findNeighbor(parent); // UpToC(parent)
@@ -468,18 +534,43 @@ double PhyloTreeSciPhy::combineAtBranch(PhyloNode *parent, PhyloNode *child) {
                           down_nei->length);
 }
 
-/**
- * Compute the log-likelihood of the entire tree.
- * 
- * @param pattern_lh Optional output array to store per-pattern log-likelihoods.
- * @param save_log_value Unused parameter for compatibility with base class.
- */
+// Founder (all-unedited) -> root_int over the origin branch of length t.
+double PhyloTreeSciPhy::originClosure(const std::vector<SciPhyAncestorPartials> &bio,
+                                      double t, double *pattern_lh_out) {
+    const size_t nptn = aln->getNPattern();
+    const double NEG_INF = -std::numeric_limits<double>::infinity();
+    const double tt = std::max(0.0, t);
+    double tree_lh = 0.0;
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads) if (num_threads > 1) reduction(+: tree_lh)
+    for (int p = 0; p < (int)nptn; ++p) {
+        const SciPhyAncestorPartials &b = bio[p];
+        if (b.wildcard) {
+            // tape dropped in every cell: only the dropout constant
+            const double lp = b.log_scale;
+            if (pattern_lh_out) pattern_lh_out[p] = lp;
+            tree_lh += lp * ptn_freq[p];
+            continue;
+        }
+        double lse = NEG_INF;
+        if (!b.ancestors.empty()) {
+            const std::vector<int> founder(b.ancestors[0].size(), 0);
+            for (size_t x = 0; x < b.ancestors.size(); ++x) {
+                if (b.partial_lh[x] <= 0.0) continue;
+                const double lt = logTransProbVec(founder, b.ancestors[x], tt);
+                if (lt == NEG_INF) continue;
+                lse = logAdd(lse, lt + std::log(b.partial_lh[x]));
+            }
+        }
+        const double lp = (lse == NEG_INF) ? NEG_INF : lse + b.log_scale;
+        if (pattern_lh_out) pattern_lh_out[p] = lp;
+        tree_lh += lp * ptn_freq[p];
+    }
+    return tree_lh;
+}
+
+// Whole-tree log-likelihood (full downward pass); fills _pattern_lh and optionally pattern_lh.
 double PhyloTreeSciPhy::computeSciPhyLikelihood(double *pattern_lh, bool save_log_value) {
     (void)save_log_value;
-
-    // Keep the origin pseudo-branch length in sync with (origin_time - tree_height) each call, 
-    //      since tree_height changes as branches / NNI swaps modify the tree.
-    syncOriginBranchLength();
 
     if (!_pattern_lh) {
         initializeAllPartialLh();
@@ -488,12 +579,11 @@ double PhyloTreeSciPhy::computeSciPhyLikelihood(double *pattern_lh, bool save_lo
 
     PhyloNeighbor *saved_current_it      = current_it;
     PhyloNeighbor *saved_current_it_back = current_it_back;
-    clearAllPartialLH(); // TODO: we currently just clear it because we don't have a way to know which branches are dirty and need recomputation.  This is a potential optimization for the future.
+    clearAllPartialLH();   // TODO: track dirty branches instead of clearing everything
     current_it      = saved_current_it;
     current_it_back = saved_current_it_back;
 
     const size_t nptn = aln->getNPattern();
-    const double eps = 1e-300;
     double tree_lh = 0.0;
 
     const BarcodeAlignment *barcode_aln = dynamic_cast<const BarcodeAlignment*>(aln);
@@ -507,42 +597,26 @@ double PhyloTreeSciPhy::computeSciPhyLikelihood(double *pattern_lh, bool save_lo
         return ninf;
     }
 
-    // Compute (and cache) the downward partial of the whole biological subtree at root_int, over all patterns.
+    // Origin branch (founder -> root_int) is a free length; initialize only if unset.
     PhyloNeighbor *origin_edge = (PhyloNeighbor*) root->neighbors[0];
     PhyloNode *root_node = (PhyloNode*) root;
+    if (origin_edge->length < params->min_branch_length) {
+        const ModelSciPhy *sm = dynamic_cast<const ModelSciPhy*>(model);
+        const double init = (sm ? 0.5 * sm->getOriginTime() : 1.0);
+        origin_edge->length = init;
+        PhyloNeighbor *ob = (PhyloNeighbor*) origin_edge->node->findNeighbor(root_node);
+        if (ob) ob->length = init;
+    }
+
     computeSciPhyDownward(origin_edge, root_node);
     const std::vector<SciPhyAncestorPartials> &bio = *origin_edge->sciphy_partial;
-
-    // founder = all-zeros, transition through the origin branch (length t) to every possible state at root_int,
-    // then add back the subtree's log_scale.
-    const double t = std::max(0.0, origin_edge->length);
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads) if (num_threads > 1) reduction(+: tree_lh)
-    for (int p = 0; p < (int)nptn; ++p) {
-        const SciPhyAncestorPartials &b = bio[p];
-        double pattern_prob = 0.0;
-        if (!b.ancestors.empty()) {
-            const std::vector<int> founder(b.ancestors[0].size(), 0);
-            for (size_t x = 0; x < b.ancestors.size(); ++x) {
-                if (b.partial_lh[x] <= 0.0) continue;
-                const double tr = transProbVec(founder, b.ancestors[x], t);
-                if (tr > 0.0) pattern_prob += tr * b.partial_lh[x];
-            }
-        }
-        double lp;
-        if (!(pattern_prob > 0.0) || !std::isfinite(pattern_prob)) {
-            lp = std::log(eps);
-        } else {
-            lp = std::log(pattern_prob) + b.log_scale;
-        }
-        _pattern_lh[p] = lp;
-        tree_lh += lp * ptn_freq[p];
-    }
+    tree_lh = originClosure(bio, origin_edge->length, _pattern_lh);
 
     if (pattern_lh) {
         memmove(pattern_lh, _pattern_lh, nptn * sizeof(double));
     }
 
-    // Full-precision debug print (opt-in). Set IQTREE_SCIPHY_PRINTLL=1 to print log-likelihood at 15 sigfigs
+    // IQTREE_SCIPHY_PRINTLL=1: print every logL at full precision (debugging)
     if (std::getenv("IQTREE_SCIPHY_PRINTLL")) {
         std::cout << std::setprecision(15)
                   << "SciPhy tree logL = " << tree_lh << std::endl;
@@ -550,9 +624,7 @@ double PhyloTreeSciPhy::computeSciPhyLikelihood(double *pattern_lh, bool save_lo
 
     curScore = tree_lh;
 
-    // Downward partials were just cleared and rebuilt; any previously computed upward partials no longer match, so the up/down snapshot is now stale.
-    // (getBestNNIForBran rebuilds the upward pass when it needs a snapshot.)
-    sciphy_snapshot_valid = false;
+    sciphy_snapshot_valid = false;   // upward partials are now stale
 
     return tree_lh;
 }
@@ -562,6 +634,86 @@ double PhyloTreeSciPhy::computeLikelihood(double *pattern_lh, bool save_log_valu
         return IQTree::computeLikelihood(pattern_lh, save_log_value);
     }
     return computeSciPhyLikelihood(pattern_lh, save_log_value);
+}
+
+// <----- Memory: skip the base class's num_states-sized buffers ----->
+// num_states = #distinct tape vectors (~1e4 on real data); SciPhy uses sciphy_partial instead.
+
+uint64_t PhyloTreeSciPhy::getMemoryRequired(size_t ncategory, bool full_mem) {
+    if (!hasBarcodeAlignment()) {
+        return IQTree::getMemoryRequired(ncategory, full_mem);
+    }
+    const uint64_t nptn  = aln->getNPattern();
+    const uint64_t mem_size = get_safe_upper_limit(nptn) + get_safe_upper_limit(aln->num_states);
+    uint64_t mem = 8 * mem_size * sizeof(double);           // per-pattern arrays
+    // sciphy_partial upper bound: per half-edge, nptn x (L+1) states of L ints + 1 double
+    const uint64_t L = 8;                                   // tapes have <= 5 sites
+    const uint64_t n_halfedges = 2 * std::max<uint64_t>((uint64_t)nodeNum, 2 * (uint64_t)leafNum);
+    mem += n_halfedges * nptn * ((L + 1) * (L * sizeof(int) + sizeof(double)) + 64);
+    if (model) mem += model->getMemoryRequired();
+    return mem;
+}
+
+void PhyloTreeSciPhy::initializeAllPartialLh() {
+    if (!hasBarcodeAlignment()) {
+        IQTree::initializeAllPartialLh();
+        return;
+    }
+    const int numStates = model->num_states;
+    // same per-pattern sizing as PhyloTree::initializeAllPartialLh
+    const size_t mem_size = get_safe_upper_limit(getAlnNPattern()) +
+        std::max(get_safe_upper_limit(numStates),
+                 get_safe_upper_limit(model_factory->unobserved_ptns.size()));
+    const size_t ncat_mix = site_rate->getNDiscreteRate() *
+        ((model_factory->fused_mix_rate) ? 1 : model->getNMixtures());
+
+    if (!gradient_vector)  gradient_vector  = aligned_alloc<double>(branchNum);
+    if (!hessian_diagonal) hessian_diagonal = aligned_alloc<double>(branchNum);
+    if (!_pattern_lh)      _pattern_lh      = aligned_alloc<double>(mem_size);
+    if (!_pattern_lh_cat)  _pattern_lh_cat  = aligned_alloc<double>(mem_size * ncat_mix);
+    if (!_site_lh && (params->robust_phy_keep < 1.0 || params->robust_median))
+        _site_lh = aligned_alloc<double>(getAlnNSite());
+    if (!_pattern_scaling) _pattern_scaling = aligned_alloc<double>(mem_size);
+    if (!buffer_scale_all) buffer_scale_all = aligned_alloc<double>(mem_size);
+    if (!ptn_freq) {
+        ptn_freq = aligned_alloc<double>(mem_size);
+        ptn_freq_computed = false;
+    }
+    if (!ptn_freq_pars)    ptn_freq_pars    = aligned_alloc<UINT>(mem_size);
+    if (!ptn_invar)        ptn_invar        = aligned_alloc<double>(mem_size);
+
+    // Not allocated (num_states-sized, unused): central/tip partial_lh, scale_num,
+    // nni_partial_lh, theta_all, buffer_partial_lh, G_matrix.
+    clearAllPartialLH();
+}
+
+int PhyloTreeSciPhy::wrapperFixNegativeBranch(bool force_change) {
+    if (!hasBarcodeAlignment() || force_change) {
+        return IQTree::wrapperFixNegativeBranch(force_change);
+    }
+    clearAllPartialLH();
+    // unknown lengths -> 0.1 (ML branch optimization follows)
+    int fixed = setNegativeBranch(false, 0.1, root, NULL);
+    resetCurScore();
+    return fixed;
+}
+
+void PhyloTreeSciPhy::removeIdenticalSeqs(Params &params) {
+    if (!hasBarcodeAlignment()) {
+        IQTree::removeIdenticalSeqs(params);
+        return;
+    }
+    cout << "NOTE: SciPhy barcode alignment -- identical sequences are kept "
+            "(de-duplication would drop the barcode alignment type)" << endl;
+}
+
+void PhyloTreeSciPhy::reorientPartialLh(PhyloNeighbor* dad_branch, Node *dad) {
+    if (!hasBarcodeAlignment()) {
+        IQTree::reorientPartialLh(dad_branch, dad);
+        return;
+    }
+    // no base partial_lh buffers; sciphy_partial moves with the half-edges
+    (void)dad_branch; (void)dad;
 }
 
 double PhyloTreeSciPhy::computeLikelihoodBranch(PhyloNeighbor *dad_branch,
@@ -577,7 +729,6 @@ double PhyloTreeSciPhy::computeLikelihoodBranch(PhyloNeighbor *dad_branch,
 }
 
 double PhyloTreeSciPhy::computeLikelihoodFromBuffer() {
-    // we do not have a SIMD kernel, so we ignore the buffer and just call computeSciPhyLikelihood directly
     if (!hasBarcodeAlignment()) {
         return IQTree::computeLikelihoodFromBuffer();
     }
@@ -591,15 +742,13 @@ void PhyloTreeSciPhy::computePatternLikelihood(double *pattern_lh, double *cur_l
         return;
     }
 
-    // computeSciPhyLikelihood fills _pattern_lh[ptn] with the per-pattern log likelihood and (when pattern_lh != nullptr) moves it into pattern_lh.
     const double tree_lh = computeSciPhyLikelihood(pattern_lh, true);
 
     if (cur_logl) {
         *cur_logl = tree_lh;
     }
 
-    // SciPhy has a single implicit rate category, so the per-category output
-    // is just a copy of the per-pattern log likelihoods.
+    // single rate category: per-category = per-pattern
     if (pattern_lh_cat) {
         const size_t nptn = aln->getNPattern();
         const double *src = pattern_lh ? pattern_lh : _pattern_lh;
@@ -617,7 +766,7 @@ void PhyloTreeSciPhy::optimizeOneBranch(PhyloNode *node1, PhyloNode *node2,
         return;
     }
 
-    // Skip the synthetic root edge in rooted-tree storage mode
+    // skip the synthetic root edge
     if (rooted && (node1 == root || node2 == root)) {
         return;
     }
@@ -655,23 +804,27 @@ void PhyloTreeSciPhy::optimizeOneBranch(PhyloNode *node1, PhyloNode *node2,
         node2->clearReversePartialLh(node1);
     }
 
-    (void)maxNRStep;  // unused: only matters for the Newton path we skipped
+    (void)maxNRStep;   // no Newton step
 }
 
 
+// Brent objective; the active mode picks which branch `value` sets.
 double PhyloTreeSciPhy::computeFunction(double value) {
-    // the central branch length of a *swapped*
-    // topology is optimized against two local vectors that were built without
-    // mutating the tree. 
+    if (sciphy_origin_active) {
+        PhyloNeighbor *origin_edge = (PhyloNeighbor*) root->neighbors[0];
+        origin_edge->length = value;
+        PhyloNeighbor *ob = (PhyloNeighbor*) origin_edge->node->findNeighbor(root);
+        if (ob) ob->length = value;
+        return -originClosure(*origin_edge->sciphy_partial, value, nullptr);
+    }
     if (sciphy_nni_active) {
+        // central branch of a candidate NNI, against local partials
         return -combineVectors(*sciphy_nni_up, *sciphy_nni_down, value);
     }
     if (!sciphy_combine_active) {
         return PhyloTree::computeFunction(value);
     }
-    // Fast branch-length combine mode: set the branch length on both directed
-    // neighbors and evaluate the whole-tree log-likelihood by combining at
-    // (parent, child) using the cached snapshot partials.
+    // branch sweep: combine at (parent, child) using the snapshot
     current_it->length = value;
     current_it_back->length = value;
     return -combineAtBranch(sciphy_combine_parent, sciphy_combine_child);
@@ -701,9 +854,6 @@ void PhyloTreeSciPhy::computeSciPhyFullUpward() {
         seed[p].log_scale = 0.0;
     }
     computeSciPhyUpward(root_int, root_node);
-
-    // Downward (from the caller's computeSciPhyLikelihood) + upward (just filled)
-    // now form a consistent snapshot of the current tree.
     sciphy_snapshot_valid = true;
 }
 
@@ -714,14 +864,12 @@ void PhyloTreeSciPhy::optimizeOneBranchCombine(PhyloNode *node1, PhyloNode *node
     current_it_back = (PhyloNeighbor*) node2->findNeighbor(node1);
     if (!current_it || !current_it_back) return;
 
-    // parent = the endpoint toward the root.
     if (current_it->direction == TOWARD_ROOT) {
         sciphy_combine_parent = node2; sciphy_combine_child = node1;
     } else {
         sciphy_combine_parent = node1; sciphy_combine_child = node2;
     }
 
-    // Both snapshot partials must be present; otherwise leave this branch as-is.
     PhyloNeighbor *down_nei = (PhyloNeighbor*) sciphy_combine_parent->findNeighbor(sciphy_combine_child);
     PhyloNeighbor *up_nei   = (PhyloNeighbor*) sciphy_combine_child->findNeighbor(sciphy_combine_parent);
     if (!down_nei->sciphy_partial || !up_nei->sciphy_partial) return;
@@ -739,8 +887,29 @@ void PhyloTreeSciPhy::optimizeOneBranchCombine(PhyloNode *node1, PhyloNode *node
     if (negative_lh > initial_neg_lh + 1e-8) optx = current_len;   // keep if no improvement
     current_it->length      = optx;
     current_it_back->length = optx;
-    // No invalidation here: the whole sweep runs against one snapshot (Jacobi);
-    // optimizeAllBranches recomputes the exact likelihood afterwards.
+    // no invalidation: the whole sweep uses one snapshot (Jacobi)
+}
+
+void PhyloTreeSciPhy::optimizeOriginBranch() {
+    if (!rooted || !root || root->neighbors.empty()) return;
+    PhyloNeighbor *origin_edge = (PhyloNeighbor*) root->neighbors[0];
+    if (!origin_edge->sciphy_partial) return;   // need cached Down(root_int)
+    PhyloNeighbor *ob = (PhyloNeighbor*) origin_edge->node->findNeighbor(root);
+
+    double cur = origin_edge->length;
+    if (cur < params->min_branch_length) cur = params->min_branch_length;
+
+    sciphy_origin_active = true;
+    double neg = 0.0, ferr = 0.0;
+    const double init_neg = -originClosure(*origin_edge->sciphy_partial, cur, nullptr);
+    const double optx = minimizeOneDimen(params->min_branch_length, cur,
+                                         params->max_branch_length, params->min_branch_length,
+                                         &neg, &ferr);
+    sciphy_origin_active = false;
+
+    const double best = (neg > init_neg + 1e-8) ? cur : optx;
+    origin_edge->length = best;
+    if (ob) ob->length = best;
 }
 
 double PhyloTreeSciPhy::optimizeAllBranches(int my_iterations, double tolerance, int maxNRStep) {
@@ -749,7 +918,6 @@ double PhyloTreeSciPhy::optimizeAllBranches(int my_iterations, double tolerance,
     }
     (void)maxNRStep;
 
-    // Branch directions (parent vs child) are needed to orient each combine.
     if (rooted) computeBranchDirection();
 
     NodeVector nodes, nodes2;
@@ -763,15 +931,15 @@ double PhyloTreeSciPhy::optimizeAllBranches(int my_iterations, double tolerance,
         const double prev_lh = tree_lh;
         saveBranchLengths(saved_lengths);
 
-        // Build one consistent up/down snapshot for this sweep. 
+        // one up/down snapshot per sweep
         computeSciPhyLikelihood(nullptr, true);
         computeSciPhyFullUpward();
+        optimizeOriginBranch();
 
         for (size_t j = 0; j < nodes.size(); ++j) {
             optimizeOneBranchCombine((PhyloNode*) nodes[j], (PhyloNode*) nodes2[j]);
         }
 
-        // Exact likelihood with the new branch lengths (full recompute).
         tree_lh = computeLikelihood(nullptr, true);
 
         if (verbose_mode >= VB_MED) {
@@ -803,7 +971,7 @@ double PhyloTreeSciPhy::optimizeRootPosition(int root_dist, bool write_info,
     if (!hasBarcodeAlignment()) {
         return IQTree::optimizeRootPosition(root_dist, write_info, logl_epsilon);
     }
-    // no-op, root is fixed
+    // root is fixed
     (void)root_dist;
     (void)write_info;
     (void)logl_epsilon;
@@ -823,7 +991,6 @@ void PhyloTreeSciPhy::buildDownwardLocal(PhyloNode *child, PhyloNode *parent,
     const size_t nptn = aln->getNPattern();
     out.assign(nptn, SciPhyAncestorPartials());
 
-    // child's children = all neighbors except the edge back to `parent`.
     std::vector<PhyloNeighbor*> kids;
     for (NeighborVec::iterator nit = child->neighbors.begin();
          nit != child->neighbors.end(); ++nit) {
@@ -831,41 +998,76 @@ void PhyloTreeSciPhy::buildDownwardLocal(PhyloNode *child, PhyloNode *parent,
     }
     if (kids.empty()) { out.clear(); return; }
     for (PhyloNeighbor *k : kids)
-        if (!k->sciphy_partial) { out.clear(); return; }   // cache miss => bail
+        if (!k->sciphy_partial) { out.clear(); return; }   // cache miss
 
+    // same combine as computeSciPhyDownward
     for (size_t p = 0; p < nptn; ++p) {
         SciPhyAncestorPartials &result = out[p];
-        result.ancestors = (*kids[0]->sciphy_partial)[p].ancestors;
-        for (size_t k = 1; k < kids.size(); ++k) {
+        const double NEG_INF = -std::numeric_limits<double>::infinity();
+
+        std::vector<PhyloNeighbor*> obs_kids;
+        double wild_scale = 0.0;
+        for (size_t k = 0; k < kids.size(); ++k) {
+            const SciPhyAncestorPartials &cp = (*kids[k]->sciphy_partial)[p];
+            if (cp.wildcard) wild_scale += cp.log_scale;
+            else             obs_kids.push_back(kids[k]);
+        }
+        if (obs_kids.empty()) {
+            result.wildcard = true;
+            result.ancestors.clear();
+            result.partial_lh.clear();
+            result.log_scale = wild_scale;
+            continue;
+        }
+
+        result.ancestors = (*obs_kids[0]->sciphy_partial)[p].ancestors;
+        for (size_t k = 1; k < obs_kids.size(); ++k) {
             result.ancestors = intersectAncestorLists(
-                result.ancestors, (*kids[k]->sciphy_partial)[p].ancestors);
+                result.ancestors, (*obs_kids[k]->sciphy_partial)[p].ancestors);
             if (result.ancestors.empty()) break;
         }
         result.partial_lh.assign(result.ancestors.size(), 0.0);
+
+        double base_scale = wild_scale;
+        for (size_t k = 0; k < obs_kids.size(); ++k)
+            base_scale += (*obs_kids[k]->sciphy_partial)[p].log_scale;
+
+        std::vector<std::vector<double>> log_cp(obs_kids.size());
+        for (size_t k = 0; k < obs_kids.size(); ++k) {
+            const SciPhyAncestorPartials &cd = (*obs_kids[k]->sciphy_partial)[p];
+            log_cp[k].resize(cd.ancestors.size());
+            for (size_t c = 0; c < cd.ancestors.size(); ++c)
+                log_cp[k][c] = (cd.partial_lh[c] > 0.0) ? std::log(cd.partial_lh[c]) : NEG_INF;
+        }
+
+        std::vector<double> log_rel(result.ancestors.size(), NEG_INF);
+        double max_log_rel = NEG_INF;
         for (size_t s_idx = 0; s_idx < result.ancestors.size(); ++s_idx) {
             const std::vector<int> &s_vec = result.ancestors[s_idx];
-            double lh_s = 1.0;
-            for (size_t k = 0; k < kids.size(); ++k) {
-                const SciPhyAncestorPartials &cd = (*kids[k]->sciphy_partial)[p];
-                const double blen = kids[k]->length;
-                double sum_child = 0.0;
+            double log_lh_s = 0.0;
+            for (size_t k = 0; k < obs_kids.size(); ++k) {
+                const SciPhyAncestorPartials &cd = (*obs_kids[k]->sciphy_partial)[p];
+                const double blen = obs_kids[k]->length;
+                double child_lse = NEG_INF;
                 for (size_t c_idx = 0; c_idx < cd.ancestors.size(); ++c_idx) {
-                    if (cd.partial_lh[c_idx] <= 0.0) continue;
-                    const double tr = transProbVec(s_vec, cd.ancestors[c_idx], blen);
-                    if (tr > 0.0) sum_child += tr * cd.partial_lh[c_idx];
+                    if (log_cp[k][c_idx] == NEG_INF) continue;
+                    const double lt = logTransProbVec(s_vec, cd.ancestors[c_idx], blen);
+                    if (lt == NEG_INF) continue;
+                    child_lse = logAdd(child_lse, lt + log_cp[k][c_idx]);
                 }
-                lh_s *= sum_child;
-                if (lh_s <= 0.0) break;
+                log_lh_s += child_lse;
+                if (log_lh_s == NEG_INF) break;
             }
-            result.partial_lh[s_idx] = lh_s;
+            log_rel[s_idx] = log_lh_s;
+            if (log_lh_s > max_log_rel) max_log_rel = log_lh_s;
         }
-        double ls = 0.0;
-        for (size_t k = 0; k < kids.size(); ++k)
-            ls += (*kids[k]->sciphy_partial)[p].log_scale;
-        double mx = 0.0;
-        for (double v : result.partial_lh) if (v > mx) mx = v;
-        if (mx > 0.0) { for (double &v : result.partial_lh) v /= mx; ls += std::log(mx); }
-        result.log_scale = ls;
+        if (max_log_rel == NEG_INF) {
+            result.log_scale = NEG_INF;
+        } else {
+            for (size_t s_idx = 0; s_idx < result.ancestors.size(); ++s_idx)
+                result.partial_lh[s_idx] = std::exp(log_rel[s_idx] - max_log_rel);
+            result.log_scale = base_scale + max_log_rel;
+        }
     }
 }
 
@@ -874,8 +1076,7 @@ void PhyloTreeSciPhy::buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
     const size_t nptn = aln->getNPattern();
     out.assign(nptn, SciPhyAncestorPartials());
 
-    // parent's toward-root neighbor holds UpToC(P) (P = parent's parent, or the
-    // founder seed when parent == root_int). Its length is len(P, parent).
+    // parent's toward-root half-edge holds UpToC(grandparent or founder)
     PhyloNeighbor *pnei = nullptr;
     for (NeighborVec::iterator nit = parent->neighbors.begin();
          nit != parent->neighbors.end(); ++nit) {
@@ -888,8 +1089,7 @@ void PhyloTreeSciPhy::buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
     const std::vector<SciPhyAncestorPartials> &upP = *pnei->sciphy_partial;
     const double len_Pp = pnei->length;
 
-    // parent's children = all neighbors except the toward-root one; one of them
-    // is `child` (the target edge), the rest are siblings.
+    // parent's children: `child` plus its siblings
     std::vector<PhyloNeighbor*> kids;
     PhyloNeighbor *child_nei = nullptr;
     for (NeighborVec::iterator nit = parent->neighbors.begin();
@@ -905,56 +1105,93 @@ void PhyloTreeSciPhy::buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
 
     for (size_t p = 0; p < nptn; ++p) {
         SciPhyAncestorPartials &result = out[p];
-        result.ancestors = (*kids[0]->sciphy_partial)[p].ancestors;
-        for (size_t k = 1; k < kids.size(); ++k) {
+        const double NEG_INF = -std::numeric_limits<double>::infinity();
+        const SciPhyAncestorPartials &uP = upP[p];
+
+        // observed kids define the support; all-missing -> constant
+        std::vector<PhyloNeighbor*> obs_support;
+        for (size_t k = 0; k < kids.size(); ++k)
+            if (!(*kids[k]->sciphy_partial)[p].wildcard) obs_support.push_back(kids[k]);
+
+        if (uP.wildcard || obs_support.empty()) {
+            double ls = totalLogMass(uP);
+            for (size_t k = 0; k < kids.size(); ++k) {
+                if (kids[k] == child_nei) continue;
+                const SciPhyAncestorPartials &dd = (*kids[k]->sciphy_partial)[p];
+                if (dd.wildcard) ls += dd.log_scale;
+            }
+            result.wildcard = true;
+            result.ancestors.clear();
+            result.partial_lh.clear();
+            result.log_scale = ls;
+            continue;
+        }
+
+        result.ancestors = (*obs_support[0]->sciphy_partial)[p].ancestors;
+        for (size_t k = 1; k < obs_support.size(); ++k) {
             result.ancestors = intersectAncestorLists(
-                result.ancestors, (*kids[k]->sciphy_partial)[p].ancestors);
+                result.ancestors, (*obs_support[k]->sciphy_partial)[p].ancestors);
             if (result.ancestors.empty()) break;
         }
         result.partial_lh.assign(result.ancestors.size(), 0.0);
 
-        // UpBar(parent)[s] = sum_{sP} UpToC(P)[sP] * trans(sP -> s, len_Pp)
-        const SciPhyAncestorPartials &uP = upP[p];
-        double ls = uP.log_scale;
+        double base_scale = uP.log_scale;
+
+        // UpBar(parent), then times each sibling's down contribution
+        std::vector<double> log_uP(uP.ancestors.size(), NEG_INF);
+        for (size_t j = 0; j < uP.ancestors.size(); ++j)
+            log_uP[j] = (uP.partial_lh[j] > 0.0) ? std::log(uP.partial_lh[j]) : NEG_INF;
+
+        std::vector<double> log_rel(result.ancestors.size(), NEG_INF);
         for (size_t i = 0; i < result.ancestors.size(); ++i) {
             const std::vector<int> &s = result.ancestors[i];
-            double acc = 0.0;
+            double lse = NEG_INF;
             for (size_t j = 0; j < uP.ancestors.size(); ++j) {
-                if (uP.partial_lh[j] <= 0.0) continue;
-                const double tr = transProbVec(uP.ancestors[j], s, len_Pp);
-                if (tr > 0.0) acc += uP.partial_lh[j] * tr;
+                if (log_uP[j] == NEG_INF) continue;
+                const double lt = logTransProbVec(uP.ancestors[j], s, len_Pp);
+                if (lt == NEG_INF) continue;
+                lse = logAdd(lse, log_uP[j] + lt);
             }
-            result.partial_lh[i] = acc;
+            log_rel[i] = lse;
         }
 
-        // multiply by every sibling's down contribution (children except `child`)
         for (size_t k = 0; k < kids.size(); ++k) {
             if (kids[k] == child_nei) continue;
             const SciPhyAncestorPartials &dd = (*kids[k]->sciphy_partial)[p];
+            if (dd.wildcard) { base_scale += dd.log_scale; continue; }
             const double blen = kids[k]->length;
+            std::vector<double> log_dd(dd.ancestors.size(), NEG_INF);
+            for (size_t jj = 0; jj < dd.ancestors.size(); ++jj)
+                log_dd[jj] = (dd.partial_lh[jj] > 0.0) ? std::log(dd.partial_lh[jj]) : NEG_INF;
             for (size_t i = 0; i < result.ancestors.size(); ++i) {
-                if (result.partial_lh[i] <= 0.0) continue;
+                if (log_rel[i] == NEG_INF) continue;
                 const std::vector<int> &s = result.ancestors[i];
-                double sm = 0.0;
+                double sm = NEG_INF;
                 for (size_t jj = 0; jj < dd.ancestors.size(); ++jj) {
-                    if (dd.partial_lh[jj] <= 0.0) continue;
-                    const double tr = transProbVec(s, dd.ancestors[jj], blen);
-                    if (tr > 0.0) sm += tr * dd.partial_lh[jj];
+                    if (log_dd[jj] == NEG_INF) continue;
+                    const double lt = logTransProbVec(s, dd.ancestors[jj], blen);
+                    if (lt == NEG_INF) continue;
+                    sm = logAdd(sm, lt + log_dd[jj]);
                 }
-                result.partial_lh[i] *= sm;
+                log_rel[i] += sm;
             }
-            ls += dd.log_scale;
+            base_scale += dd.log_scale;
         }
-        double mx = 0.0;
-        for (double v : result.partial_lh) if (v > mx) mx = v;
-        if (mx > 0.0) { for (double &v : result.partial_lh) v /= mx; ls += std::log(mx); }
-        result.log_scale = ls;
+
+        double max_log_rel = NEG_INF;
+        for (double v : log_rel) if (v > max_log_rel) max_log_rel = v;
+        if (max_log_rel == NEG_INF) {
+            result.log_scale = NEG_INF;
+        } else {
+            for (size_t i = 0; i < result.ancestors.size(); ++i)
+                result.partial_lh[i] = std::exp(log_rel[i] - max_log_rel);
+            result.log_scale = base_scale + max_log_rel;
+        }
     }
 }
 
 void PhyloTreeSciPhy::doNNI(NNIMove &move, bool clearLH) {
     PhyloTree::doNNI(move, clearLH);
-    // Topology changed: the cached up/down snapshot no longer matches the tree.
     sciphy_snapshot_valid = false;
 }
 
@@ -963,7 +1200,7 @@ void PhyloTreeSciPhy::changeNNIBrans(NNIMove &nnimove) {
         PhyloTree::changeNNIBrans(nnimove);
         return;
     }
-    // Apply only the central branch length we optimized during scoring.
+    // only the central branch was optimized during scoring
     if (nnimove.newLen[0].empty()) return;
     PhyloNeighbor *n12 = (PhyloNeighbor*) nnimove.node1->findNeighbor(nnimove.node2);
     PhyloNeighbor *n21 = (PhyloNeighbor*) nnimove.node2->findNeighbor(nnimove.node1);
@@ -983,10 +1220,9 @@ NNIMove PhyloTreeSciPhy::getBestNNIForBran(PhyloNode *node1, PhyloNode *node2,
     ASSERT(!node1->isLeaf() && !node2->isLeaf());
     ASSERT(node1->degree() == 3 && node2->degree() == 3);
 
-    // One valid snapshot for the whole evaluateNNIs pass (rebuilt only if stale).
     ensureSciPhySnapshot();
 
-    // Orient so node1 is the parent (node1 -> node2 points away from the root).
+    // orient so node1 is the parent
     if (((PhyloNeighbor*)node1->findNeighbor(node2))->direction == TOWARD_ROOT) {
         PhyloNode *tmp = node1; node1 = node2; node2 = tmp;
     }
@@ -1001,8 +1237,7 @@ NNIMove PhyloTreeSciPhy::getBestNNIForBran(PhyloNode *node1, PhyloNode *node2,
         nniMoves[0].node1 = nullptr;
     }
 
-    // Set up the two candidate swaps exactly as the base does: node1Nei is
-    // node1's non-parent child; node2Nei ranges over node2's two children.
+    // two candidate swaps: node1's other child with each of node2's children
     if (!nniMoves[0].node1) {
         int cnt = 0;
         FOR_NEIGHBOR_IT(node1, node2, node1_it)
@@ -1026,7 +1261,6 @@ NNIMove PhyloTreeSciPhy::getBestNNIForBran(PhyloNode *node1, PhyloNode *node2,
     PhyloNeighbor *central_back = (PhyloNeighbor*) node2->findNeighbor(node1);
     const double orig_central_len = central->length;
     const size_t nptn = aln->getNPattern();
-    double optlen_arr[2] = {orig_central_len, orig_central_len};
 
     auto rawSwap = [&](int cnt) {
         NeighborVec::iterator n1it = nniMoves[cnt].node1Nei_it;
@@ -1040,8 +1274,6 @@ NNIMove PhyloTreeSciPhy::getBestNNIForBran(PhyloNode *node1, PhyloNode *node2,
     auto undoSwap = [&](int cnt) {
         NeighborVec::iterator n1it = nniMoves[cnt].node1Nei_it;
         NeighborVec::iterator n2it = nniMoves[cnt].node2Nei_it;
-        // after rawSwap, *n1it holds node2's old child, *n2it holds node1's old
-        // child; restore each to its original neighbor object.
         Neighbor *cur_n1 = *n1it, *cur_n2 = *n2it;
         node1->updateNeighbor(n1it, cur_n2);
         cur_n2->node->updateNeighbor(node2, node1);
@@ -1049,43 +1281,62 @@ NNIMove PhyloTreeSciPhy::getBestNNIForBran(PhyloNode *node1, PhyloNode *node2,
         cur_n1->node->updateNeighbor(node1, node2);
     };
 
-    // PASS 1: fast local-combine optimization 
+    // For each swap, rebuild only the two partials next to the central branch and
+    // optimize its length: O(local) per candidate instead of O(N).
+    // IQTREE_SCIPHY_CHECK=1 also computes the exact logL and reports differences.
+    const bool dbg_cache = std::getenv("IQTREE_SCIPHY_CHECK") != nullptr;
     for (int cnt = 0; cnt < 2; cnt++) if (constraintTree.isCompatible(nniMoves[cnt])) {
+        // check mode overwrites the snapshot, so rebuild it first
+        if (dbg_cache) { sciphy_snapshot_valid = false; ensureSciPhySnapshot(); }
+
         rawSwap(cnt);
         std::vector<SciPhyAncestorPartials> downChild, upParent;
         buildDownwardLocal(node2, node1, downChild);
         buildUpToCLocal(node1, node2, upParent);
-        if (downChild.size() == nptn && upParent.size() == nptn) {
+
+        double score;
+        double optlen = orig_central_len;
+        bool cached = (downChild.size() == nptn && upParent.size() == nptn);
+        // TODO: local combine is not exact with wildcard partials; use the exact recompute
+        if (cached)
+            for (size_t p = 0; p < nptn; ++p)
+                if (downChild[p].wildcard || upParent[p].wildcard) { cached = false; break; }
+        if (cached) {
             sciphy_nni_up = &upParent;
             sciphy_nni_down = &downChild;
             sciphy_nni_active = true;
             double neg = 0.0, ferr = 0.0;
             const double initial_neg = -combineVectors(upParent, downChild, orig_central_len);
-            double optlen = minimizeOneDimen(params->min_branch_length, orig_central_len,
-                                             params->max_branch_length, params->min_branch_length,
-                                             &neg, &ferr);
+            const double optx = minimizeOneDimen(params->min_branch_length, orig_central_len,
+                                                 params->max_branch_length, params->min_branch_length,
+                                                 &neg, &ferr);
             sciphy_nni_active = false;
             sciphy_nni_up = sciphy_nni_down = nullptr;
-            if (neg > initial_neg + 1e-8) optlen = orig_central_len;
-            optlen_arr[cnt] = optlen;
+            const bool keep_orig = (neg > initial_neg + 1e-8);
+            optlen = keep_orig ? orig_central_len : optx;
+            score  = -(keep_orig ? initial_neg : neg);
+        } else {
+            central->length = central_back->length = orig_central_len;
+            score = computeLikelihood();
         }
+
+        if (dbg_cache) {
+            central->length = central_back->length = optlen;
+            const double exact = computeLikelihood();
+            if (std::fabs(exact - score) > 1e-6)
+                std::cerr << std::setprecision(12)
+                          << "[nni cache check] n1=" << node1->id << " n2=" << node2->id
+                          << " cnt=" << cnt << " cached=" << score << " exact=" << exact
+                          << " diff=" << (exact - score) << (cached ? "" : " (fallback)") << "\n";
+            score = exact;
+        }
+
+        central->length = central_back->length = orig_central_len;
+        nniMoves[cnt].newloglh = score;
+        nniMoves[cnt].newLen[0].assign(1, optlen);
         undoSwap(cnt);
     }
 
-    // PASS 2: EXACT likelihood of each swapped topology
-    for (int cnt = 0; cnt < 2; cnt++) if (constraintTree.isCompatible(nniMoves[cnt])) {
-        rawSwap(cnt);
-        central->length      = optlen_arr[cnt];
-        central_back->length = optlen_arr[cnt];
-        const double exact = computeLikelihood();
-        nniMoves[cnt].newloglh = exact;
-        nniMoves[cnt].newLen[0].assign(1, optlen_arr[cnt]);
-        central->length      = orig_central_len;
-        central_back->length = orig_central_len;
-        undoSwap(cnt);
-    }
-
-    // Restore the original snapshot + score for the next branch in this pass.
     ensureSciPhySnapshot();
     curScore = backupScore;
 

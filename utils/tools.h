@@ -1867,6 +1867,12 @@ public:
      */
     double sciphy_clock_rate;
 
+    /**
+     * SciPhy: per-tip dropout probability q (--dropout-prob; SciPhy "missingProbability").
+     * -1 = not set (dropped tapes weighted 1).
+     */
+    double sciphy_dropout_prob;
+
     /** optimize the parameters according to the HMM model (HMMSTER) */
     bool optimize_params_use_hmm;
 

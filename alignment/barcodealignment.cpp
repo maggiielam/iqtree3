@@ -168,13 +168,17 @@ bool BarcodeAlignment::parseScarsList(const string &scarsText, vector<int> &out)
             return false;
         }
         int value = 0;
-        try {
-            value = stoi(item);
-        } catch (...) {
-            return false;
-        }
-        if (value < 0) {
-            return false;
+        if (item == "?") {
+            value = -1;                 // missing site (dropout); encoded as -1
+        } else {
+            try {
+                value = stoi(item);
+            } catch (...) {
+                return false;
+            }
+            if (value < 0) {
+                return false;
+            }
         }
         out.push_back(value);
     }
@@ -572,6 +576,11 @@ int BarcodeAlignment::buildTapeAlignment(const vector<string> &cellNames,
             vector<int> tape_vec(data[c].begin() + offset,
                                  data[c].begin() + offset + slen);
 
+            // fully-missing tape (all '?') is a dropout, not a state
+            bool missing = std::all_of(tape_vec.begin(), tape_vec.end(),
+                                       [](int x){ return x < 0; });
+            if (missing) continue;
+
             for (int v : tape_vec)
                 max_insertion_type = max(max_insertion_type, v);
 
@@ -603,7 +612,11 @@ int BarcodeAlignment::buildTapeAlignment(const vector<string> &cellNames,
         for (int c = 0; c < num_cells; ++c) {
             vector<int> tape_vec(data[c].begin() + offset,
                                  data[c].begin() + offset + slen);
-            pat[c] = (StateType)tape_to_state.at(tape_vec);
+            bool missing = std::all_of(tape_vec.begin(), tape_vec.end(),
+                                       [](int x){ return x < 0; });
+            // dropout -> STATE_UNKNOWN (wildcard in the SciPhy likelihood)
+            pat[c] = missing ? (StateType) STATE_UNKNOWN
+                             : (StateType) tape_to_state.at(tape_vec);
         }
 
         addPattern(pat, t, 1);

@@ -40,6 +40,7 @@
 #include "tree/phylotreemixlen.h"
 #include "tree/phylotreesciphy.h"
 #include "model/modelmarkov.h"
+#include "model/modelsciphy.h"
 #include "model/modeldna.h"
 #include "model/modelpomo.h"
 #include "nclextra/myreader.h"
@@ -581,6 +582,12 @@ void reportModel(ostream &out, Alignment *aln, ModelSubst *m) {
     int i, j, k;
 
     if (aln->seq_type == SEQ_CODON) {
+        m->writeInfo(out);
+        return;
+    }
+
+    // SciPhy has no dense rate matrix (it would be num_states^2)
+    if (dynamic_cast<ModelSciPhy*>(m)) {
         m->writeInfo(out);
         return;
     }

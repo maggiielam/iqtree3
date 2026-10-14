@@ -2181,6 +2181,16 @@ void parseArg(int argc, char *argv[], Params &params) {
 					throw "--clock-rate must be non-negative";
 				continue;
 			}
+			// --dropout-prob <q>: per-tip dropout probability
+			if (strcmp(argv[cnt], "--dropout-prob") == 0) {
+				cnt++;
+				if (cnt >= argc)
+					throw "Use --dropout-prob <q>";
+				params.sciphy_dropout_prob = convert_double(argv[cnt]);
+				if (params.sciphy_dropout_prob < 0.0 || params.sciphy_dropout_prob >= 1.0)
+					throw "--dropout-prob must be in [0,1)";
+				continue;
+			}
 			if (strcmp(argv[cnt], "-pdgain") == 0) {
 				params.calc_pdgain = true;
 				continue;
@@ -7550,6 +7560,7 @@ void Params::setDefault() {
     sciphy_origin_time = -1.0;
     sciphy_edit_probs  = "";
     sciphy_clock_rate  = -1.0;
+    sciphy_dropout_prob = -1.0;   // not set: dropped tapes contribute a flat 1
 
     tree_gen = NONE;
     user_file = NULL;

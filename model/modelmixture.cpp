@@ -1226,6 +1226,10 @@ ModelSubst* createModel(string model_str, ModelsBlock *models_block,
 			if (sp_params.sciphy_clock_rate > 0.0) {
 				sciphy_model->fixClockRate(sp_params.sciphy_clock_rate);
 			}
+			// --dropout-prob: per-tip dropout probability q
+			if (sp_params.sciphy_dropout_prob > 0.0) {
+				sciphy_model->setDropoutProb(sp_params.sciphy_dropout_prob);
+			}
 			model = sciphy_model;
 		} else {
 			model = new ModelMorphology(model_str.c_str(), model_params, freq_type, freq_params, tree);

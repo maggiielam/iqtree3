@@ -33,6 +33,8 @@ struct SciPhyAncestorPartials {
     std::vector<std::vector<int>> ancestors;
     std::vector<double> partial_lh;
     double log_scale = 0.0;
+    // dropout: tape present but unobserved; no states, constant carried in log_scale
+    bool wildcard = false;
 };
 
 /**
