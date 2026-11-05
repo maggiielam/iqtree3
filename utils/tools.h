@@ -1850,10 +1850,8 @@ public:
     double sciphy_origin_time;
 
     /**
-     * SciPhy: comma-separated edit_probs supplied by the user via
-     * --edit-probs, e.g. "0.1,0.1,0.1,...". Empty means "not set" -- the
-     * model defaults to a uniform 1/M distribution over the M scar types
-     * observed in the alignment.
+     * SciPhy --edit-probs: empty (default) = estimated from the insert
+     * frequencies in the alignment; "uniform" = 1/M; or "p1,...,pM".
      */
     string sciphy_edit_probs;
 
@@ -1872,6 +1870,10 @@ public:
      * -1 = not set (dropped tapes weighted 1).
      */
     double sciphy_dropout_prob;
+
+    /** --clock-date: after the search (or -te), estimate node ages and clock rate under a strict
+        clock (origin = --origin-time before sampling) and write <prefix>.timetree.nwk */
+    bool sciphy_clock_date;
 
     /** optimize the parameters according to the HMM model (HMMSTER) */
     bool optimize_params_use_hmm;

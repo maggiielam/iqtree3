@@ -2165,10 +2165,14 @@ void parseArg(int argc, char *argv[], Params &params) {
 				params.sciphy_origin_time = convert_double(argv[cnt]);
 				continue;
 			}
+			if (strcmp(argv[cnt], "--clock-date") == 0) {
+				params.sciphy_clock_date = true;
+				continue;
+			}
 			if (strcmp(argv[cnt], "--edit-probs") == 0) {
 				cnt++;
 				if (cnt >= argc)
-					throw "Use --edit-probs <p1,p2,...,pM>";
+					throw "Use --edit-probs <p1,p2,...,pM | uniform | est>";
 				params.sciphy_edit_probs = argv[cnt];
 				continue;
 			}
@@ -7560,7 +7564,8 @@ void Params::setDefault() {
     sciphy_origin_time = -1.0;
     sciphy_edit_probs  = "";
     sciphy_clock_rate  = -1.0;
-    sciphy_dropout_prob = -1.0;   // not set: dropped tapes contribute a flat 1
+    sciphy_dropout_prob = -1.0;
+    sciphy_clock_date = false;   // not set: dropped tapes contribute a flat 1
 
     tree_gen = NONE;
     user_file = NULL;

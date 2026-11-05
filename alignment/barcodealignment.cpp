@@ -627,3 +627,23 @@ int BarcodeAlignment::buildTapeAlignment(const vector<string> &cellNames,
 
     return 1;
 }
+
+std::vector<double> BarcodeAlignment::estimateEditProbs(double alpha) const {
+    const int M = std::max(1, max_insertion_type);
+    std::vector<double> counts((size_t)M, 0.0);
+    const int n_states = (int)tape_states.size();
+    if (n_states == 0) return std::vector<double>((size_t)M, 1.0 / M);
+    for (size_t ptn = 0; ptn < size(); ++ptn) {
+        const Pattern &pat = at(ptn);
+        for (size_t seq = 0; seq < getNSeq(); ++seq) {
+            const int st = (int)pat[seq];
+            if (st < 0 || st >= n_states) continue;      // missing / unknown
+            for (int scar : tape_states[st])
+                if (scar >= 1 && scar <= M) counts[scar - 1] += pat.frequency;
+        }
+    }
+    double tot = 0.0;
+    for (double &c : counts) { c += alpha; tot += c; }
+    for (double &c : counts) c /= tot;
+    return counts;
+}

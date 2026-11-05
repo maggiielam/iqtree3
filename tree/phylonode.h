@@ -14,6 +14,7 @@
 
 #include "node.h"
 #include <vector>
+#include <memory>
 
 typedef unsigned short UBYTE;
 
@@ -35,6 +36,13 @@ struct SciPhyAncestorPartials {
     double log_scale = 0.0;
     // dropout: tape present but unobserved; no states, constant carried in log_scale
     bool wildcard = false;
+    // Upward partials only. A wildcard up partial (the subtree below is all-missing) keeps its
+    // state dependence here instead of collapsing to a constant:
+    //   value(s) = exp(log_scale - totalMass(anchor)) * sum_j anchor(j) * Trans(anchor_j -> s, anchor_len)
+    // anchor = the nearest non-wildcard up partial above (or the founder), so an observed subtree
+    // moved below this edge can still be scored exactly. Null = no state dependence kept.
+    std::shared_ptr<const SciPhyAncestorPartials> anchor;
+    double anchor_len = 0.0;
 };
 
 /**

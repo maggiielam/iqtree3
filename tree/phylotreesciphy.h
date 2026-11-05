@@ -81,6 +81,11 @@ public:
     // allocating the parsimony buffers (O(N*S) memory).
     virtual int wrapperFixNegativeBranch(bool force_change) override;
 
+    // Strict-clock dating of the current topology (--clock-date): node ages and clock rate by ML,
+    // tips at age 0, founder at age --origin-time. Writes <prefix>.timetree.nwk and
+    // <prefix>.clockdate.txt; the tree's free branch lengths and clock rate are restored afterwards.
+    void runClockDating(const std::string &prefix);
+
 protected:
     bool hasBarcodeAlignment() const;
 
@@ -147,6 +152,43 @@ protected:
                          std::vector<SciPhyAncestorPartials> &out) const;
 
     int getObservedLeafState(Node *leaf, size_t ptn) const;
+
+    // <----- clock dating ----->
+    std::vector<double> clock_age;              // node id -> age (time before sampling)
+    std::vector<PhyloNode*> clock_parent;       // node id -> parent (founder for root_int)
+    std::vector<PhyloNode*> clock_post;         // internal nodes, children before parents
+    double clock_T = 25.0;                      // founder age
+    // computeFunction modes
+    bool clock_age_active = false, clock_age_exact = false;
+    PhyloNode *clock_age_node = nullptr;
+    bool clock_rate_active = false;
+    bool clock_scale_active = false;
+    std::vector<double> clock_scale_base;       // ages before the scale move
+    double clock_scale_rate = 1.0;              // clock rate before the scale move
+
+    void clockCollect();
+    void clockInitAges(double root_frac);
+    void clockSetEdge(PhyloNode *a, PhyloNode *b, double len);
+    void clockApplyAge(PhyloNode *v);           // lengths of the edges around v from the ages
+    void clockApplyAllAges();
+    void clockSetRate(double r);
+    double clockRate() const;
+    double clockAgeObjective(double a);
+    double clockSweep(bool exact);
+    double clockOptimizeRate();
+    double clockOptimizeScale();
+    double clockOptimize(int max_sweeps, double tol);
+    // joint L-BFGS-B over relative ages r_v = a_v / a_parent (all in (0,1)) and log clock rate,
+    // with gradients from one up/down snapshot (exact edge-length derivatives)
+    bool clock_lbfgs_active = false;
+    std::vector<PhyloNode*> clock_pre;          // internal nodes, parents before children
+    double clockLBFGS();
+    void clockSetVars(const double *x);
+    double clockEdgeDeriv(PhyloNode *p, PhyloNode *c);
+public:
+    virtual double optimFunc(int nvar, double *vars) override;
+    virtual double optimGradient(int nvar, double *vars, double *gradient) override;
+protected:
 };
 
 #endif

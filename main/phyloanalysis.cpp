@@ -4019,6 +4019,11 @@ void runTreeReconstruction(Params &params, IQTree* &iqtree) {
 
     printFinalSearchInfo(params, *iqtree, search_cpu_time, search_real_time);
 
+    if (params.sciphy_clock_date) {
+        if (PhyloTreeSciPhy *sp = dynamic_cast<PhyloTreeSciPhy*>(iqtree))
+            sp->runClockDating(params.out_prefix);
+    }
+
     if (params.gbo_replicates && params.online_bootstrap && params.print_ufboot_trees)
         iqtree->writeUFBootTrees(params);
 

@@ -119,6 +119,7 @@ public:
 
     /** fix a parameter at a user-supplied value (skips it in optimization) */
     void fixClockRate(double v) { clock_rate = v; clock_rate_fixed = true; }
+    void setClockRate(double v) { clock_rate = v; }
 
     // Per-tip dropout probability q (SciPhy "missingProbability"): dropped -> q,
     // observed -> 1-q. Unset (<= 0) gives a flat weight of 1; q = 0 is treated as

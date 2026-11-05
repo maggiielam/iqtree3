@@ -163,6 +163,13 @@ public:
      */
     int getNumTapeStates() const { return (int)tape_states.size(); }
 
+    /**
+     * Empirical edit probabilities: frequency of each insert type 1..M over all
+     * edited sites of all cells, plus a pseudocount alpha per type, normalized.
+     * Leaf-level counting (an edit shared by k cells is counted k times).
+     */
+    std::vector<double> estimateEditProbs(double alpha = 0.5) const;
+
 protected:
     int num_sites;              ///< Total number of editing sites (all tapes)
     int max_insertion_type;     ///< Maximum insertion type value (M)

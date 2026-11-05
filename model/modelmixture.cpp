@@ -1190,10 +1190,19 @@ ModelSubst* createModel(string model_str, ModelsBlock *models_block,
 			Params &sp_params = Params::getInstance();
 			int M = std::max(1, bcaln->getMaxInsertionType());
 
-			// --edit-probs "p1,p2,...,pM" -- comma-separated known
-			// distribution over scar identities. Default: uniform 1/M.
+			// Edit probabilities over insert types 1..M. Default: estimated from
+			// the insert frequencies in the alignment. --edit-probs uniform: 1/M.
+			// --edit-probs "p1,...,pM": user-supplied.
 			std::vector<double> edit_probs;
-			if (!sp_params.sciphy_edit_probs.empty()) {
+			const string &ep = sp_params.sciphy_edit_probs;
+			if (ep.empty() || ep == "est" || ep == "estimate") {
+				edit_probs = bcaln->estimateEditProbs(0.5);
+				cout << "SciPhy edit probabilities estimated from insert frequencies:";
+				for (double p : edit_probs) cout << " " << p;
+				cout << endl;
+			} else if (ep == "uniform") {
+				edit_probs.assign((size_t)M, 1.0 / (double)M);
+			} else {
 				std::stringstream ss(sp_params.sciphy_edit_probs);
 				std::string tok;
 				while (std::getline(ss, tok, ',')) {
@@ -1204,8 +1213,6 @@ ModelSubst* createModel(string model_str, ModelsBlock *models_block,
 						+ convertIntToString(M)
 						+ " comma-separated values (one per scar type)");
 				}
-			} else {
-				edit_probs.assign((size_t)M, 1.0 / (double)M);
 			}
 
 			// --origin-time is the known experiment duration. Default 1.0

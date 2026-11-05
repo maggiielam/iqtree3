@@ -86,22 +86,21 @@ double PhyloTreeSciPhy::logTransProbVec(const std::vector<int> &parent,
     const int L = (int)parent.size();
     const int M = std::max(1, barcode_aln->getMaxInsertionType());
 
-    std::vector<int> parent_scars, child_scars;
-    parent_scars.reserve((size_t)L);
-    child_scars.reserve((size_t)L);
-    for (int x : parent) if (x != 0) parent_scars.push_back(x);
-    for (int x : child)  if (x != 0) child_scars.push_back(x);
-
-    if (parent_scars.size() > child_scars.size()) return NEG_INF;
-
-    std::vector<int> new_inserts = child_scars;
-    for (int p_scar : parent_scars) {
-        auto it = std::find(new_inserts.begin(), new_inserts.end(), p_scar);
-        if (it == new_inserts.end()) return NEG_INF;
-        new_inserts.erase(it);
+    // Sites fill left to right, so the parent's edits must sit at the same positions in the
+    // child; the child's remaining edits are the new inserts.
+    int n_parent = 0;
+    std::vector<int> new_inserts;
+    new_inserts.reserve((size_t)L);
+    for (int i = 0; i < L; ++i) {
+        if (parent[i] != 0) {
+            if (child[i] != parent[i]) return NEG_INF;
+            ++n_parent;
+        } else if (child[i] != 0) {
+            new_inserts.push_back(child[i]);
+        }
     }
 
-    const int nr_possible = L - (int)parent_scars.size();
+    const int nr_possible = L - n_parent;
     const int k = (int)new_inserts.size();
     if (k > nr_possible) return NEG_INF;
 
@@ -173,6 +172,43 @@ double totalLogMass(const SciPhyAncestorPartials &v) {
     double s = 0.0;
     for (double x : v.partial_lh) if (x > 0.0) s += x;
     return (s > 0.0) ? (std::log(s) + v.log_scale) : NEG_INF;
+}
+
+// An up partial as seen by an observed child: itself, or (for a wildcard up partial with an
+// anchor) the anchor carried over extra_len more branch length, times exp(extra_scale).
+struct UpView {
+    const SciPhyAncestorPartials *u;
+    double extra_len;
+    double extra_scale;
+};
+UpView resolveUp(const SciPhyAncestorPartials &v) {
+    if (v.wildcard && v.anchor) {
+        const double m = totalLogMass(*v.anchor);
+        if (m != -std::numeric_limits<double>::infinity())
+            return {v.anchor.get(), v.anchor_len, v.log_scale - m};
+    }
+    return {&v, 0.0, 0.0};
+}
+
+// Wildcard up partial with constant log_scale that keeps the state dependence of `up`
+// carried over a further branch of length len.
+void makeDeferredUp(SciPhyAncestorPartials &out, const SciPhyAncestorPartials &up,
+                    double len, double log_scale) {
+    out.wildcard = true;
+    out.ancestors.clear();
+    out.partial_lh.clear();
+    out.log_scale = log_scale;
+    if (up.wildcard) {
+        out.anchor = up.anchor;
+        out.anchor_len = up.anchor ? up.anchor_len + len : 0.0;
+    } else {
+        auto a = std::make_shared<SciPhyAncestorPartials>();
+        a->ancestors = up.ancestors;
+        a->partial_lh = up.partial_lh;
+        a->log_scale = up.log_scale;
+        out.anchor = a;
+        out.anchor_len = len;
+    }
 }
 
 }  // anonymous namespace
@@ -352,30 +388,37 @@ void PhyloTreeSciPhy::computeSciPhyUpward(PhyloNode *node, PhyloNode *dad) {
         const SciPhyAncestorPartials &dn = downNode[p];
         SciPhyAncestorPartials &ub = upBar[p];
 
-        // all-missing subtree or uninformative up side: collapses to the total up mass
-        if (dn.wildcard || ud.wildcard) {
+        // all-missing subtree: constant total up mass, state dependence kept as an anchor
+        if (dn.wildcard) {
+            makeDeferredUp(ub, ud, len_dad_node, totalLogMass(ud));
+            continue;
+        }
+        const UpView uv = resolveUp(ud);
+        if (uv.u->wildcard) {   // uninformative up side without an anchor
             ub.wildcard = true;
             ub.ancestors.clear();
             ub.partial_lh.clear();
             ub.log_scale = totalLogMass(ud);
             continue;
         }
+        const SciPhyAncestorPartials &ue = *uv.u;
+        const double len_eff = len_dad_node + uv.extra_len;
 
         ub.ancestors = dn.ancestors;                        // indexed by s_node
         ub.partial_lh.assign(ub.ancestors.size(), 0.0);
 
-        std::vector<double> log_ud(ud.ancestors.size(), NEG_INF);
-        for (size_t j = 0; j < ud.ancestors.size(); ++j)
-            log_ud[j] = (ud.partial_lh[j] > 0.0) ? std::log(ud.partial_lh[j]) : NEG_INF;
+        std::vector<double> log_ud(ue.ancestors.size(), NEG_INF);
+        for (size_t j = 0; j < ue.ancestors.size(); ++j)
+            log_ud[j] = (ue.partial_lh[j] > 0.0) ? std::log(ue.partial_lh[j]) : NEG_INF;
 
         std::vector<double> log_rel(ub.ancestors.size(), NEG_INF);
         double max_log_rel = NEG_INF;
         for (size_t i = 0; i < ub.ancestors.size(); ++i) {
             const std::vector<int> &s_node = ub.ancestors[i];
             double lse = NEG_INF;
-            for (size_t j = 0; j < ud.ancestors.size(); ++j) {
+            for (size_t j = 0; j < ue.ancestors.size(); ++j) {
                 if (log_ud[j] == NEG_INF) continue;
-                const double lt = logTransProbVec(ud.ancestors[j], s_node, len_dad_node);
+                const double lt = logTransProbVec(ue.ancestors[j], s_node, len_eff);
                 if (lt == NEG_INF) continue;
                 lse = logAdd(lse, log_ud[j] + lt);
             }
@@ -387,7 +430,7 @@ void PhyloTreeSciPhy::computeSciPhyUpward(PhyloNode *node, PhyloNode *dad) {
         } else {
             for (size_t i = 0; i < ub.ancestors.size(); ++i)
                 ub.partial_lh[i] = std::exp(log_rel[i] - max_log_rel);
-            ub.log_scale = ud.log_scale + max_log_rel;
+            ub.log_scale = ue.log_scale + uv.extra_scale + max_log_rel;
         }
     }
 
@@ -422,6 +465,8 @@ void PhyloTreeSciPhy::computeSciPhyUpward(PhyloNode *node, PhyloNode *dad) {
                 result.ancestors.clear();
                 result.partial_lh.clear();
                 result.log_scale = ls;
+                result.anchor = upBar[p].anchor;          // same node state: same anchor
+                result.anchor_len = upBar[p].anchor_len;
                 continue;
             }
 
@@ -483,7 +528,10 @@ double PhyloTreeSciPhy::combineVectors(const std::vector<SciPhyAncestorPartials>
     double tree_lh = 0.0;
     for (size_t p = 0; p < nptn; ++p) {
         const SciPhyAncestorPartials &dc = down[p];  // s_child
-        const SciPhyAncestorPartials &uc = up[p];    // s_parent
+        // an anchored wildcard up partial facing an observed child: use the anchor
+        const UpView uv = dc.wildcard ? UpView{&up[p], 0.0, 0.0} : resolveUp(up[p]);
+        const SciPhyAncestorPartials &uc = *uv.u;    // s_parent
+        const double len_eff = len + uv.extra_len;
         // log P(pattern) = logsumexp_{s_par}[ log up[s_par]
         //     + logsumexp_{s_child}( logTrans(s_par -> s_child, len) + log down[s_child] ) ] + scales
         double lp;
@@ -496,7 +544,7 @@ double PhyloTreeSciPhy::combineVectors(const std::vector<SciPhyAncestorPartials>
                 if (uc.partial_lh[j] > 0.0) lse = logAdd(lse, std::log(uc.partial_lh[j]));
             lp = (lse == NEG_INF) ? NEG_INF : lse + uc.log_scale + dc.log_scale;
         } else if (uc.wildcard) {
-            // up side uninformative (normally not reached): marginalize the down side
+            // up side uninformative with no anchor (not reached for snapshot partials)
             double lse = NEG_INF;
             for (size_t i = 0; i < dc.partial_lh.size(); ++i)
                 if (dc.partial_lh[i] > 0.0) lse = logAdd(lse, std::log(dc.partial_lh[i]));
@@ -509,14 +557,15 @@ double PhyloTreeSciPhy::combineVectors(const std::vector<SciPhyAncestorPartials>
                 double lse_child = NEG_INF;
                 for (size_t i = 0; i < dc.ancestors.size(); ++i) {
                     if (dc.partial_lh[i] <= 0.0) continue;
-                    const double lt = logTransProbVec(s_par, dc.ancestors[i], len);
+                    const double lt = logTransProbVec(s_par, dc.ancestors[i], len_eff);
                     if (lt == NEG_INF) continue;
                     lse_child = logAdd(lse_child, lt + std::log(dc.partial_lh[i]));
                 }
                 if (lse_child == NEG_INF) continue;
                 lse_par = logAdd(lse_par, std::log(uc.partial_lh[j]) + lse_child);
             }
-            lp = (lse_par == NEG_INF) ? NEG_INF : lse_par + dc.log_scale + uc.log_scale;
+            lp = (lse_par == NEG_INF) ? NEG_INF
+                                      : lse_par + dc.log_scale + uc.log_scale + uv.extra_scale;
         }
         tree_lh += lp * ptn_freq[p];
     }
@@ -810,6 +859,14 @@ void PhyloTreeSciPhy::optimizeOneBranch(PhyloNode *node1, PhyloNode *node2,
 
 // Brent objective; the active mode picks which branch `value` sets.
 double PhyloTreeSciPhy::computeFunction(double value) {
+    if (clock_age_active) return -clockAgeObjective(value);
+    if (clock_rate_active) { clockSetRate(value); return -computeLikelihood(); }
+    if (clock_scale_active) {
+        for (PhyloNode *v : clock_post) clock_age[v->id] = clock_scale_base[v->id] * value;
+        clockApplyAllAges();
+        clockSetRate(clock_scale_rate / value);
+        return -computeLikelihood();
+    }
     if (sciphy_origin_active) {
         PhyloNeighbor *origin_edge = (PhyloNeighbor*) root->neighbors[0];
         origin_edge->length = value;
@@ -1106,26 +1163,33 @@ void PhyloTreeSciPhy::buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
     for (size_t p = 0; p < nptn; ++p) {
         SciPhyAncestorPartials &result = out[p];
         const double NEG_INF = -std::numeric_limits<double>::infinity();
-        const SciPhyAncestorPartials &uP = upP[p];
+        const SciPhyAncestorPartials &uP0 = upP[p];
 
-        // observed kids define the support; all-missing -> constant
+        // observed kids define the support; all-missing -> constant (anchored)
         std::vector<PhyloNeighbor*> obs_support;
         for (size_t k = 0; k < kids.size(); ++k)
             if (!(*kids[k]->sciphy_partial)[p].wildcard) obs_support.push_back(kids[k]);
 
-        if (uP.wildcard || obs_support.empty()) {
-            double ls = totalLogMass(uP);
+        const UpView uv = resolveUp(uP0);
+        if (obs_support.empty() || uv.u->wildcard) {
+            double ls = totalLogMass(uP0);
             for (size_t k = 0; k < kids.size(); ++k) {
                 if (kids[k] == child_nei) continue;
                 const SciPhyAncestorPartials &dd = (*kids[k]->sciphy_partial)[p];
                 if (dd.wildcard) ls += dd.log_scale;
             }
-            result.wildcard = true;
-            result.ancestors.clear();
-            result.partial_lh.clear();
-            result.log_scale = ls;
+            if (obs_support.empty()) {
+                makeDeferredUp(result, uP0, len_Pp, ls);
+            } else {   // up side without an anchor: legacy constant
+                result.wildcard = true;
+                result.ancestors.clear();
+                result.partial_lh.clear();
+                result.log_scale = ls;
+            }
             continue;
         }
+        const SciPhyAncestorPartials &uP = *uv.u;
+        const double len_up = len_Pp + uv.extra_len;
 
         result.ancestors = (*obs_support[0]->sciphy_partial)[p].ancestors;
         for (size_t k = 1; k < obs_support.size(); ++k) {
@@ -1135,7 +1199,7 @@ void PhyloTreeSciPhy::buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
         }
         result.partial_lh.assign(result.ancestors.size(), 0.0);
 
-        double base_scale = uP.log_scale;
+        double base_scale = uP.log_scale + uv.extra_scale;
 
         // UpBar(parent), then times each sibling's down contribution
         std::vector<double> log_uP(uP.ancestors.size(), NEG_INF);
@@ -1148,7 +1212,7 @@ void PhyloTreeSciPhy::buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
             double lse = NEG_INF;
             for (size_t j = 0; j < uP.ancestors.size(); ++j) {
                 if (log_uP[j] == NEG_INF) continue;
-                const double lt = logTransProbVec(uP.ancestors[j], s, len_Pp);
+                const double lt = logTransProbVec(uP.ancestors[j], s, len_up);
                 if (lt == NEG_INF) continue;
                 lse = logAdd(lse, log_uP[j] + lt);
             }
@@ -1296,11 +1360,8 @@ NNIMove PhyloTreeSciPhy::getBestNNIForBran(PhyloNode *node1, PhyloNode *node2,
 
         double score;
         double optlen = orig_central_len;
-        bool cached = (downChild.size() == nptn && upParent.size() == nptn);
-        // TODO: local combine is not exact with wildcard partials; use the exact recompute
-        if (cached)
-            for (size_t p = 0; p < nptn; ++p)
-                if (downChild[p].wildcard || upParent[p].wildcard) { cached = false; break; }
+        // wildcard (dropout) partials are exact too: up partials keep an anchor
+        const bool cached = (downChild.size() == nptn && upParent.size() == nptn);
         if (cached) {
             sciphy_nni_up = &upParent;
             sciphy_nni_down = &downChild;
@@ -1343,4 +1404,363 @@ NNIMove PhyloTreeSciPhy::getBestNNIForBran(PhyloNode *node1, PhyloNode *node2,
     NNIMove res = (nniMoves[0].newloglh > nniMoves[1].newloglh) ? nniMoves[0] : nniMoves[1];
     if (newNNIMoves) delete[] nniMoves;
     return res;
+}
+
+// <----- Strict-clock dating (--clock-date) ----->
+// Ages a(v) = time before sampling: tips 0, founder clock_T. Branch (p -> v) has length a(p) - a(v);
+// the origin edge (founder -> root_int) has length clock_T - a(root_int).
+
+double PhyloTreeSciPhy::clockRate() const {
+    const ModelSciPhy *sm = dynamic_cast<const ModelSciPhy*>(model);
+    return sm ? sm->getClockRate() : 1.0;
+}
+
+void PhyloTreeSciPhy::clockSetRate(double r) {
+    ModelSciPhy *sm = dynamic_cast<ModelSciPhy*>(model);
+    if (sm) sm->setClockRate(r);
+}
+
+void PhyloTreeSciPhy::clockSetEdge(PhyloNode *a, PhyloNode *b, double len) {
+    PhyloNeighbor *ab = (PhyloNeighbor*) a->findNeighbor(b);
+    PhyloNeighbor *ba = (PhyloNeighbor*) b->findNeighbor(a);
+    ab->length = ba->length = len;
+}
+
+void PhyloTreeSciPhy::clockCollect() {
+    clock_age.assign(nodeNum, 0.0);
+    clock_parent.assign(nodeNum, nullptr);
+    clock_post.clear();
+    PhyloNode *founder = (PhyloNode*) root;
+    PhyloNode *root_int = (PhyloNode*) root->neighbors[0]->node;
+    clock_age[founder->id] = clock_T;
+    // iterative postorder from root_int
+    std::vector<std::pair<PhyloNode*, PhyloNode*>> stack{{root_int, founder}};
+    std::vector<std::pair<PhyloNode*, PhyloNode*>> order;
+    while (!stack.empty()) {
+        auto [v, p] = stack.back(); stack.pop_back();
+        clock_parent[v->id] = p;
+        order.push_back({v, p});
+        FOR_NEIGHBOR_IT(v, p, it) stack.push_back({(PhyloNode*)(*it)->node, v});
+    }
+    for (auto it = order.rbegin(); it != order.rend(); ++it)
+        if (!it->first->isLeaf()) clock_post.push_back(it->first);
+    clock_pre.assign(clock_post.rbegin(), clock_post.rend());
+}
+
+// Ages from the current (free) branch lengths: mean distance to the tips below each node,
+// scaled so the root sits at root_frac * T; the clock rate is set to keep expected edits fixed.
+void PhyloTreeSciPhy::clockInitAges(double root_frac) {
+    const double eps = params->min_branch_length;
+    std::vector<double> d(nodeNum, 0.0), ntip(nodeNum, 0.0);
+    for (PhyloNode *v : clock_post) {
+        double sum = 0.0, cnt = 0.0;
+        FOR_NEIGHBOR_IT(v, clock_parent[v->id], it) {
+            PhyloNode *c = (PhyloNode*)(*it)->node;
+            const double nc = c->isLeaf() ? 1.0 : ntip[c->id];
+            sum += nc * (d[c->id] + (*it)->length);
+            cnt += nc;
+        }
+        ntip[v->id] = cnt;
+        d[v->id] = cnt > 0 ? sum / cnt : 0.0;
+    }
+    PhyloNode *root_int = (PhyloNode*) root->neighbors[0]->node;
+    const double droot = std::max(d[root_int->id], eps);
+    const double scale = root_frac * clock_T / droot;   // days per unit of free length
+    for (PhyloNode *v : clock_post) {
+        double lo = 0.0;
+        FOR_NEIGHBOR_IT(v, clock_parent[v->id], it) lo = std::max(lo, clock_age[(*it)->node->id] + eps);
+        clock_age[v->id] = std::min(std::max(d[v->id] * scale, lo), clock_T - eps);
+    }
+    clockSetRate(clockRate() / scale);
+    clockApplyAllAges();
+}
+
+void PhyloTreeSciPhy::clockApplyAge(PhyloNode *v) {
+    const double eps = params->min_branch_length;
+    PhyloNode *p = clock_parent[v->id];
+    clockSetEdge(p, v, std::max(clock_age[p->id] - clock_age[v->id], eps));
+    FOR_NEIGHBOR_IT(v, p, it) {
+        PhyloNode *c = (PhyloNode*)(*it)->node;
+        clockSetEdge(v, c, std::max(clock_age[v->id] - clock_age[c->id], eps));
+    }
+}
+
+void PhyloTreeSciPhy::clockApplyAllAges() {
+    for (PhyloNode *v : clock_post) clockApplyAge(v);
+}
+
+// logL as a function of the age of clock_age_node. Exact: full recompute. Local: Down(v) rebuilt
+// from the cached children partials, combined with the cached UpToC(parent) (snapshot).
+double PhyloTreeSciPhy::clockAgeObjective(double a) {
+    PhyloNode *v = clock_age_node;
+    PhyloNode *p = clock_parent[v->id];
+    clock_age[v->id] = a;
+    clockApplyAge(v);
+    if (clock_age_exact) return computeLikelihood();
+    std::vector<SciPhyAncestorPartials> down;
+    buildDownwardLocal(v, p, down);
+    PhyloNeighbor *up_nei = (PhyloNeighbor*) v->findNeighbor(p);   // UpToC(p), excluding v's subtree
+    if (down.empty() || !up_nei->sciphy_partial) return computeLikelihood();
+    return combineVectors(*up_nei->sciphy_partial, down,
+                          std::max(clock_age[p->id] - a, params->min_branch_length));
+}
+
+double PhyloTreeSciPhy::clockSweep(bool exact) {
+    const double eps = params->min_branch_length;
+    const bool dbg = std::getenv("IQTREE_SCIPHY_CHECK") != nullptr;
+    if (!exact) { sciphy_snapshot_valid = false; ensureSciPhySnapshot(); }
+    for (PhyloNode *v : clock_post) {
+        PhyloNode *p = clock_parent[v->id];
+        double lo = eps;
+        FOR_NEIGHBOR_IT(v, p, it) lo = std::max(lo, clock_age[(*it)->node->id] + eps);
+        const double hi = clock_age[p->id] - eps;
+        const double cur = clock_age[v->id];
+        if (hi <= lo) continue;
+        if (dbg && !exact) {   // local objective vs full recompute on a fresh snapshot
+            sciphy_snapshot_valid = false; ensureSciPhySnapshot();
+            clock_age_node = v; clock_age_exact = false;
+            const double loc = clockAgeObjective(cur);
+            const double ex = computeLikelihood();
+            if (std::fabs(loc - ex) > 1e-6)
+                std::cerr << std::setprecision(12) << "[clock age check] node " << v->id
+                          << " local " << loc << " exact " << ex << " diff " << (loc - ex) << "\n";
+            sciphy_snapshot_valid = false; ensureSciPhySnapshot();
+        }
+        clock_age_node = v; clock_age_exact = exact; clock_age_active = true;
+        const double init_neg = computeFunction(cur);
+        double neg = 0.0, ferr = 0.0;
+        double opt = minimizeOneDimen(lo, std::min(std::max(cur, lo), hi), hi, 1e-5, &neg, &ferr);
+        clock_age_active = false;
+        if (neg > init_neg) opt = cur;
+        clock_age[v->id] = opt;
+        clockApplyAge(v);
+        if (!exact) {   // refresh Down(v) so v's parent sees its new subtree
+            std::vector<SciPhyAncestorPartials> down;
+            buildDownwardLocal(v, p, down);
+            PhyloNeighbor *pv = (PhyloNeighbor*) p->findNeighbor(v);
+            if (!down.empty() && pv->sciphy_partial) *pv->sciphy_partial = down;
+        }
+    }
+    return computeLikelihood();
+}
+
+double PhyloTreeSciPhy::clockOptimizeRate() {
+    const double cur = clockRate();
+    clock_rate_active = true;
+    const double init_neg = computeFunction(cur);
+    double neg = 0.0, ferr = 0.0;
+    double opt = minimizeOneDimen(1e-6, cur, 1e3, 1e-7, &neg, &ferr);
+    clock_rate_active = false;
+    if (neg > init_neg) opt = cur;
+    clockSetRate(opt);
+    return computeLikelihood();
+}
+
+// Move along the rate-age ridge: all internal ages x s, clock rate / s.
+double PhyloTreeSciPhy::clockOptimizeScale() {
+    const double eps = params->min_branch_length;
+    PhyloNode *root_int = (PhyloNode*) root->neighbors[0]->node;
+    clock_scale_base = clock_age;
+    clock_scale_rate = clockRate();
+    double smin = 0.0;   // keep every internal branch >= eps after scaling
+    for (PhyloNode *v : clock_post) if (clock_scale_base[v->id] > 0) smin = std::max(smin, eps / clock_scale_base[v->id]);
+    const double smax = (clock_T - eps) / clock_scale_base[root_int->id];
+    clock_scale_active = true;
+    const double init_neg = computeFunction(1.0);
+    double neg = 0.0, ferr = 0.0;
+    double opt = minimizeOneDimen(std::max(smin, 0.05), 1.0, smax, 1e-7, &neg, &ferr);
+    if (neg > init_neg) opt = 1.0;
+    computeFunction(opt);
+    clock_scale_active = false;
+    return computeLikelihood();
+}
+
+double PhyloTreeSciPhy::clockOptimize(int max_sweeps, double tol) {
+    double ll = computeLikelihood();
+    for (int round = 0; round < 20; ++round) {   // joint L-BFGS-B until it stops gaining
+        const double t0 = getRealTime();
+        const double l2 = clockLBFGS();
+        if (verbose_mode >= VB_MED)
+            std::cout << "Clock dating L-BFGS-B: logL " << l2 << " rate " << clockRate() << " root age "
+                      << clock_age[root->neighbors[0]->node->id] << " (" << getRealTime() - t0 << " s)" << std::endl;
+        const bool done = (l2 - ll < tol);
+        ll = std::max(ll, l2);
+        if (done) break;
+    }
+    for (int it = 0; it < max_sweeps; ++it) {   // coordinate polish
+        const double prev = ll;
+        const double t0 = getRealTime();
+        ll = clockOptimizeScale();
+        ll = clockOptimizeRate();
+        const double t1 = getRealTime();
+        const std::vector<double> saved = clock_age;
+        double ls = clockSweep(false);
+        if (verbose_mode >= VB_MED)
+            std::cout << "  (scale+rate " << t1 - t0 << " s, ages " << getRealTime() - t1 << " s)" << std::endl;
+        if (ls < ll - 1e-6) {   // the snapshot sweep went wrong: undo, redo exactly
+            if (verbose_mode >= VB_MED)
+                std::cout << "Clock dating: snapshot sweep lowered logL (" << ll << " -> " << ls
+                          << "), redoing it exactly" << std::endl;
+            clock_age = saved; clockApplyAllAges();
+            ls = clockSweep(true);
+        }
+        ll = ls;
+        if (verbose_mode >= VB_MED)
+            std::cout << "Clock dating sweep " << it + 1 << ": logL " << ll << " rate " << clockRate()
+                      << " root age " << clock_age[root->neighbors[0]->node->id] << std::endl;
+        if (ll - prev < tol) break;
+    }
+    return ll;
+}
+
+void PhyloTreeSciPhy::runClockDating(const std::string &prefix) {
+    if (!hasBarcodeAlignment() || !rooted || !root || root->neighbors.empty()) {
+        outWarning("--clock-date needs a rooted SciPhy (barcode) tree; skipped");
+        return;
+    }
+    const ModelSciPhy *sm = dynamic_cast<const ModelSciPhy*>(model);
+    clock_T = sm ? sm->getOriginTime() : 25.0;
+    if (rooted) computeBranchDirection();
+    DoubleVector free_len;
+    saveBranchLengths(free_len);
+    const double free_rate = clockRate();
+    const double ll_free = computeLikelihood();
+
+    cout << endl << "Clock dating (strict clock, founder " << clock_T << " before sampling)..." << endl;
+    clockCollect();
+    // a few root-age starts, refined briefly; keep the best and finish it
+    double best_ll = -std::numeric_limits<double>::infinity();
+    std::vector<double> best_age; double best_rate = free_rate;
+    for (double frac : {0.5, 0.8, 0.95}) {
+        restoreBranchLengths(free_len); clockSetRate(free_rate);
+        clockInitAges(frac);
+        computeLikelihood();
+        clockOptimizeScale();
+        const double ll = clockOptimizeRate();
+        if (ll > best_ll) { best_ll = ll; best_age = clock_age; best_rate = clockRate(); }
+    }
+    clock_age = best_age; clockSetRate(best_rate); clockApplyAllAges();
+    const double ll_clock = clockOptimize(20, 1e-3);
+    const double root_age = clock_age[root->neighbors[0]->node->id];
+
+    const string tfile = prefix + ".timetree.nwk";
+    printTree(tfile.c_str(), WT_BR_LEN | WT_BR_LEN_FIXED_WIDTH | WT_SORT_TAXA | WT_NEWLINE);
+    ofstream out((prefix + ".clockdate.txt").c_str());
+    out << std::setprecision(10) << "clock_rate\t" << clockRate() << "\nroot_age\t" << root_age
+        << "\norigin_time\t" << clock_T << "\nlogL_clock\t" << ll_clock << "\nlogL_free\t" << ll_free << "\n";
+    out.close();
+    cout << "Clock rate: " << clockRate() << "  root age: " << root_age << "  logL (clock): " << ll_clock
+         << "  logL (free branch lengths): " << ll_free << endl;
+    cout << "Time tree (branch lengths in time units) written to " << tfile << endl;
+
+    restoreBranchLengths(free_len);
+    clockSetRate(free_rate);
+    computeLikelihood();
+}
+
+void PhyloTreeSciPhy::clockSetVars(const double *x) {
+    const size_t K = clock_pre.size();
+    for (size_t i = 0; i < K; ++i) {
+        PhyloNode *v = clock_pre[i];
+        clock_age[v->id] = x[i] * clock_age[clock_parent[v->id]->id];
+    }
+    clockSetRate(std::exp(x[K]));
+    clockApplyAllAges();
+}
+
+double PhyloTreeSciPhy::optimFunc(int nvar, double *vars) {
+    if (!clock_lbfgs_active) return IQTree::optimFunc(nvar, vars);
+    clockSetVars(vars);
+    return -computeLikelihood();
+}
+
+// d logL / d length of edge (p -> c), central difference on the snapshot combine
+double PhyloTreeSciPhy::clockEdgeDeriv(PhyloNode *p, PhyloNode *c) {
+    PhyloNeighbor *down = (PhyloNeighbor*) p->findNeighbor(c);
+    PhyloNeighbor *up = (PhyloNeighbor*) c->findNeighbor(p);
+    if (!down->sciphy_partial || !up->sciphy_partial) return 0.0;
+    const double len = down->length;
+    const double h = std::max(1e-7, 1e-4 * len);
+    const double lo = std::max(len - h, 0.0);
+    const double fp = combineVectors(*up->sciphy_partial, *down->sciphy_partial, len + h);
+    const double fm = combineVectors(*up->sciphy_partial, *down->sciphy_partial, lo);
+    return (fp - fm) / (len + h - lo);
+}
+
+double PhyloTreeSciPhy::optimGradient(int nvar, double *x, double *g) {
+    if (!clock_lbfgs_active) return IQTree::optimGradient(nvar, x, g);
+    clockSetVars(x);
+    sciphy_snapshot_valid = false;
+    ensureSciPhySnapshot();
+    const double ll = curScore;
+    // dL/da_u = sum_children dL/dlen(u,c) - dL/dlen(parent,u); dL/dlograte = sum_edges len * dL/dlen
+    std::vector<double> dA(nodeNum, 0.0);
+    double dlog_rate = 0.0;
+    for (PhyloNode *u : clock_post) {
+        PhyloNode *p = clock_parent[u->id];
+        const double dpe = clockEdgeDeriv(p, u);
+        dA[u->id] -= dpe;
+        dlog_rate += ((PhyloNeighbor*) p->findNeighbor(u))->length * dpe;
+        FOR_NEIGHBOR_IT(u, p, it) {
+            PhyloNode *c = (PhyloNode*)(*it)->node;
+            if (!c->isLeaf()) continue;   // internal children are handled as u themselves
+            const double dc = clockEdgeDeriv(u, c);
+            dA[u->id] += dc;
+            dlog_rate += (*it)->length * dc;
+        }
+    }
+    // internal child edges: dL/dlen(u,c) adds to dA[u] (subtracted from dA[c] above)
+    for (PhyloNode *c : clock_post) {
+        PhyloNode *u = clock_parent[c->id];
+        if (u == root) continue;
+        dA[u->id] += clockEdgeDeriv(u, c);
+    }
+    // dL/dr_v = (1/r_v) * sum over internal u in subtree(v) of a_u * dL/da_u
+    std::vector<double> S(nodeNum, 0.0);
+    for (PhyloNode *u : clock_post) {
+        S[u->id] += clock_age[u->id] * dA[u->id];
+        PhyloNode *p = clock_parent[u->id];
+        if (p != root) S[p->id] += S[u->id];
+    }
+    const size_t K = clock_pre.size();
+    for (size_t i = 0; i < K; ++i) g[i] = -S[clock_pre[i]->id] / x[i];
+    g[K] = -dlog_rate;
+    return -ll;
+}
+
+double PhyloTreeSciPhy::clockLBFGS() {
+    const size_t K = clock_pre.size();
+    std::vector<double> x(K + 1), lo(K + 1), hi(K + 1);
+    for (size_t i = 0; i < K; ++i) {
+        PhyloNode *v = clock_pre[i];
+        x[i] = clock_age[v->id] / clock_age[clock_parent[v->id]->id];
+        lo[i] = 1e-6; hi[i] = 1.0 - 1e-6;
+        x[i] = std::min(std::max(x[i], lo[i]), hi[i]);
+    }
+    x[K] = std::log(clockRate()); lo[K] = std::log(1e-6); hi[K] = std::log(1e3);
+    clock_lbfgs_active = true;
+    if (std::getenv("IQTREE_SCIPHY_CHECK")) {   // analytic vs numerical gradient
+        std::vector<double> g(K + 1), xx = x;
+        optimGradient((int)K + 1, xx.data(), g.data());
+        for (size_t i = 0; i <= K; i += std::max<size_t>(1, K / 8)) {
+            const double h = 1e-6, xi = xx[i];
+            xx[i] = xi + h; const double fp = optimFunc((int)K + 1, xx.data());
+            xx[i] = xi - h; const double fm = optimFunc((int)K + 1, xx.data());
+            xx[i] = xi;
+            const double num = (fp - fm) / (2 * h);
+            if (std::fabs(num - g[i]) > 1e-3 * std::max(1.0, std::fabs(num)))
+                std::cerr << "[clock grad check] var " << i << " analytic " << g[i] << " numeric " << num << "\n";
+        }
+        { const double h = 1e-6, xi = xx[K];
+          xx[K] = xi + h; const double fp = optimFunc((int)K + 1, xx.data());
+          xx[K] = xi - h; const double fm = optimFunc((int)K + 1, xx.data()); xx[K] = xi;
+          const double num = (fp - fm) / (2 * h);
+          if (std::fabs(num - g[K]) > 1e-3 * std::max(1.0, std::fabs(num)))
+              std::cerr << "[clock grad check] log rate analytic " << g[K] << " numeric " << num << "\n"; }
+        std::cerr << "[clock grad check] done (" << K + 1 << " variables)\n";
+    }
+    L_BFGS_B((int)K + 1, x.data(), lo.data(), hi.data(), 1e-6, 2000);
+    clock_lbfgs_active = false;
+    clockSetVars(x.data());
+    return computeLikelihood();
 }
