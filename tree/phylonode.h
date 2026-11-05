@@ -144,6 +144,9 @@ public:
         delete sciphy_tape_partial;
     }
 
+    // owns the SciPhy caches: copying would double-free
+    PhyloNeighbor &operator=(const PhyloNeighbor &) = delete;
+
 
     /**
      allocate a new Neighbor by just copying from this one
