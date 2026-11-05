@@ -18,11 +18,22 @@
 #include <iostream>
 #include <limits>
 
-PhyloTreeSciPhy::PhyloTreeSciPhy() : IQTree() {}
+namespace {
+PhyloTreeSciPhy::SciPhyKernel kernelFromEnv();
+}
 
-PhyloTreeSciPhy::PhyloTreeSciPhy(Alignment *aln) : IQTree(aln) {}
+PhyloTreeSciPhy::PhyloTreeSciPhy() : IQTree(), sciphy_kernel(kernelFromEnv()),
+    oracle_direct_tail(sciphy_kernel == SCIPHY_KERNEL_CHECK) {}
 
-PhyloTreeSciPhy::~PhyloTreeSciPhy() {}
+PhyloTreeSciPhy::PhyloTreeSciPhy(Alignment *aln) : IQTree(aln), sciphy_kernel(kernelFromEnv()),
+    oracle_direct_tail(sciphy_kernel == SCIPHY_KERNEL_CHECK) {}
+
+PhyloTreeSciPhy::~PhyloTreeSciPhy() {
+    for (auto &it : check_stats)
+        std::cout << std::scientific << std::setprecision(2) << "[sciphy kernel check] " << it.first
+                  << ": " << it.second.n << " tape comparisons, max relative |dlogL| = "
+                  << it.second.max_rel << ", " << it.second.fail << " above 1e-10" << std::endl;
+}
 
 bool PhyloTreeSciPhy::hasBarcodeAlignment() const {
     return dynamic_cast<BarcodeAlignment*>(this->aln) != nullptr;
@@ -119,8 +130,18 @@ double PhyloTreeSciPhy::logTransProbVec(const std::vector<int> &parent,
 
     if (k == nr_possible) {
         // Absorbing tail P(K >= nr_possible) under Poisson(distance).
+        // TODO: 1 - sum cancels when the tail is below ~1e-16 (short branches), e.g.
+        // 2e-17 instead of 2e-45; use a direct sum or the incomplete gamma P(r, mu).
+        // The check oracle already uses the direct sum (oracle_direct_tail).
         double tail = 1.0;
-        for (int i = 0; i < nr_possible; ++i) tail -= poissonPMF(i, distance);
+        if (oracle_direct_tail) {
+            tail = (nr_possible == 0) ? 1.0 : 0.0;
+            if (nr_possible > 0)
+                for (int i = nr_possible; i < nr_possible + 60 || i < 2.0 * distance + 60; ++i)
+                    tail += poissonPMF(i, distance);
+        } else {
+            for (int i = 0; i < nr_possible; ++i) tail -= poissonPMF(i, distance);
+        }
         if (tail > 0.0) return std::log(tail) + log_insert;
         // tail underflowed: use its leading term P(K = nr_possible)
         return logPoissonPMF(nr_possible, distance) + log_insert;
@@ -519,7 +540,7 @@ void PhyloTreeSciPhy::computeSciPhyUpward(PhyloNode *node, PhyloNode *dad) {
 // Whole-tree logL from an up partial and a down partial joined by a branch of length len.
 double PhyloTreeSciPhy::combineVectors(const std::vector<SciPhyAncestorPartials> &up,
                                       const std::vector<SciPhyAncestorPartials> &down,
-                                      double len) const {
+                                      double len, double *pattern_lh_out) const {
     const size_t nptn = aln->getNPattern();
     const double NEG_INF = -std::numeric_limits<double>::infinity();
     if (up.size() != nptn || down.size() != nptn) {
@@ -567,6 +588,7 @@ double PhyloTreeSciPhy::combineVectors(const std::vector<SciPhyAncestorPartials>
             lp = (lse_par == NEG_INF) ? NEG_INF
                                       : lse_par + dc.log_scale + uc.log_scale + uv.extra_scale;
         }
+        if (pattern_lh_out) pattern_lh_out[p] = lp;
         tree_lh += lp * ptn_freq[p];
     }
     return tree_lh;
@@ -576,11 +598,24 @@ double PhyloTreeSciPhy::combineVectors(const std::vector<SciPhyAncestorPartials>
 double PhyloTreeSciPhy::combineAtBranch(PhyloNode *parent, PhyloNode *child) {
     PhyloNeighbor *down_nei = (PhyloNeighbor*) parent->findNeighbor(child); // Down(child)
     PhyloNeighbor *up_nei   = (PhyloNeighbor*) child->findNeighbor(parent); // UpToC(parent)
-    if (!down_nei->sciphy_partial || !up_nei->sciphy_partial) {
+    if (!hasPartial(down_nei) || !hasPartial(up_nei)) {
         return -std::numeric_limits<double>::infinity();
     }
-    return combineVectors(*up_nei->sciphy_partial, *down_nei->sciphy_partial,
-                          down_nei->length);
+    if (useOldKernel())
+        return combineVectors(*up_nei->sciphy_partial, *down_nei->sciphy_partial,
+                              down_nei->length);
+    if (checking()) {
+        const size_t nptn = aln->getNPattern();
+        std::vector<double> new_ptn(nptn), old_ptn(nptn);
+        const double lh = combineTape(*up_nei->sciphy_tape_partial, *down_nei->sciphy_tape_partial,
+                                      down_nei->length, new_ptn.data());
+        combineVectors(*up_nei->sciphy_partial, *down_nei->sciphy_partial,
+                       down_nei->length, old_ptn.data());
+        checkTapes("branch", new_ptn.data(), old_ptn.data());
+        return lh;
+    }
+    return combineTape(*up_nei->sciphy_tape_partial, *down_nei->sciphy_tape_partial,
+                       down_nei->length);
 }
 
 // Founder (all-unedited) -> root_int over the origin branch of length t.
@@ -657,9 +692,25 @@ double PhyloTreeSciPhy::computeSciPhyLikelihood(double *pattern_lh, bool save_lo
         if (ob) ob->length = init;
     }
 
-    computeSciPhyDownward(origin_edge, root_node);
-    const std::vector<SciPhyAncestorPartials> &bio = *origin_edge->sciphy_partial;
-    tree_lh = originClosure(bio, origin_edge->length, _pattern_lh);
+    if (useOldKernel()) {
+        computeSciPhyDownward(origin_edge, root_node);
+        tree_lh = originClosure(*origin_edge->sciphy_partial, origin_edge->length, _pattern_lh);
+    } else {
+        initTapeKernel();
+        computeTapeDownward(origin_edge, root_node);
+        tree_lh = originClosureTape(*origin_edge->sciphy_tape_partial, origin_edge->length, _pattern_lh);
+    }
+
+    if (checking()) {
+        // old kernel from scratch on the same tree; computed flags are shared
+        clearAllPartialLH();
+        current_it      = saved_current_it;
+        current_it_back = saved_current_it_back;
+        computeSciPhyDownward(origin_edge, root_node);
+        std::vector<double> old_ptn(nptn);
+        originClosure(*origin_edge->sciphy_partial, origin_edge->length, old_ptn.data());
+        checkTapes("likelihood", _pattern_lh, old_ptn.data());
+    }
 
     if (pattern_lh) {
         memmove(pattern_lh, _pattern_lh, nptn * sizeof(double));
@@ -876,11 +927,23 @@ double PhyloTreeSciPhy::computeFunction(double value) {
         origin_edge->length = value;
         PhyloNeighbor *ob = (PhyloNeighbor*) origin_edge->node->findNeighbor(root);
         if (ob) ob->length = value;
-        return -originClosure(*origin_edge->sciphy_partial, value, nullptr);
+        if (useOldKernel())
+            return -originClosure(*origin_edge->sciphy_partial, value, nullptr);
+        if (checking()) {
+            const size_t nptn = aln->getNPattern();
+            std::vector<double> new_ptn(nptn), old_ptn(nptn);
+            const double lh = originClosureTape(*origin_edge->sciphy_tape_partial, value, new_ptn.data());
+            originClosure(*origin_edge->sciphy_partial, value, old_ptn.data());
+            checkTapes("origin", new_ptn.data(), old_ptn.data());
+            return -lh;
+        }
+        return -originClosureTape(*origin_edge->sciphy_tape_partial, value, nullptr);
     }
     if (sciphy_nni_active) {
         // central branch of a candidate NNI, against local partials
-        return -combineVectors(*sciphy_nni_up, *sciphy_nni_down, value);
+        if (useOldKernel())
+            return -combineVectors(*sciphy_nni_up, *sciphy_nni_down, value);
+        return -combineTape(*sciphy_nni_up_tape, *sciphy_nni_down_tape, value);
     }
     if (!sciphy_combine_active) {
         return PhyloTree::computeFunction(value);
@@ -892,6 +955,18 @@ double PhyloTreeSciPhy::computeFunction(double value) {
 }
 
 void PhyloTreeSciPhy::computeSciPhyFullUpward() {
+    if (useOldKernel()) {
+        computeAncestorFullUpward();
+        return;
+    }
+    computeTapeFullUpward();
+    if (checking()) {
+        computeAncestorFullUpward();
+        checkAllBranches();
+    }
+}
+
+void PhyloTreeSciPhy::computeAncestorFullUpward() {
     if (!rooted || !root || root->neighbors.empty()) return;
     const BarcodeAlignment *barcode_aln = dynamic_cast<const BarcodeAlignment*>(aln);
     if (!barcode_aln) return;
@@ -933,7 +1008,7 @@ void PhyloTreeSciPhy::optimizeOneBranchCombine(PhyloNode *node1, PhyloNode *node
 
     PhyloNeighbor *down_nei = (PhyloNeighbor*) sciphy_combine_parent->findNeighbor(sciphy_combine_child);
     PhyloNeighbor *up_nei   = (PhyloNeighbor*) sciphy_combine_child->findNeighbor(sciphy_combine_parent);
-    if (!down_nei->sciphy_partial || !up_nei->sciphy_partial) return;
+    if (!hasPartial(down_nei) || !hasPartial(up_nei)) return;
 
     const double current_len = current_it->length;
     double negative_lh = 0.0, ferror = 0.0;
@@ -954,7 +1029,7 @@ void PhyloTreeSciPhy::optimizeOneBranchCombine(PhyloNode *node1, PhyloNode *node
 void PhyloTreeSciPhy::optimizeOriginBranch() {
     if (!rooted || !root || root->neighbors.empty()) return;
     PhyloNeighbor *origin_edge = (PhyloNeighbor*) root->neighbors[0];
-    if (!origin_edge->sciphy_partial) return;   // need cached Down(root_int)
+    if (!hasPartial(origin_edge)) return;   // need cached Down(root_int)
     PhyloNeighbor *ob = (PhyloNeighbor*) origin_edge->node->findNeighbor(root);
 
     double cur = origin_edge->length;
@@ -962,7 +1037,7 @@ void PhyloTreeSciPhy::optimizeOriginBranch() {
 
     sciphy_origin_active = true;
     double neg = 0.0, ferr = 0.0;
-    const double init_neg = -originClosure(*origin_edge->sciphy_partial, cur, nullptr);
+    const double init_neg = computeFunction(cur);
     const double optx = minimizeOneDimen(params->min_branch_length, cur,
                                          params->max_branch_length, params->min_branch_length,
                                          &neg, &ferr);
@@ -1363,27 +1438,53 @@ NNIMove PhyloTreeSciPhy::getBestNNIForBran(PhyloNode *node1, PhyloNode *node2,
 
         rawSwap(cnt);
         std::vector<SciPhyAncestorPartials> downChild, upParent;
-        buildDownwardLocal(node2, node1, downChild);
-        buildUpToCLocal(node1, node2, downChild, upParent);
+        bool cached;
+        if (useOldKernel()) {
+            buildDownwardLocal(node2, node1, downChild);
+            buildUpToCLocal(node1, node2, downChild, upParent);
+            cached = (downChild.size() == nptn && upParent.size() == nptn);
+            // wildcard (dropout) partials are exact too: up partials keep an anchor
+        } else {
+            buildTapeDownwardLocal(node2, node1, tape_nni_down);
+            buildTapeUpToCLocal(node1, node2, tape_nni_down, tape_nni_up);
+            cached = (tape_nni_down.head.size() == nptn && tape_nni_up.head.size() == nptn);
+            // tape partials keep no anchor: wildcard tapes use the exact recompute
+            if (cached)
+                for (size_t p = 0; p < nptn; ++p)
+                    if (tape_nni_down.head[p].wildcard || tape_nni_up.head[p].wildcard) { cached = false; break; }
+        }
 
         double score;
         double optlen = orig_central_len;
-        // wildcard (dropout) partials are exact too: up partials keep an anchor
-        const bool cached = (downChild.size() == nptn && upParent.size() == nptn);
         if (cached) {
             sciphy_nni_up = &upParent;
             sciphy_nni_down = &downChild;
+            sciphy_nni_up_tape = &tape_nni_up;
+            sciphy_nni_down_tape = &tape_nni_down;
             sciphy_nni_active = true;
             double neg = 0.0, ferr = 0.0;
-            const double initial_neg = -combineVectors(upParent, downChild, orig_central_len);
+            const double initial_neg = computeFunction(orig_central_len);
             const double optx = minimizeOneDimen(params->min_branch_length, orig_central_len,
                                                  params->max_branch_length, params->min_branch_length,
                                                  &neg, &ferr);
             sciphy_nni_active = false;
             sciphy_nni_up = sciphy_nni_down = nullptr;
+            sciphy_nni_up_tape = sciphy_nni_down_tape = nullptr;
             const bool keep_orig = (neg > initial_neg + 1e-8);
             optlen = keep_orig ? orig_central_len : optx;
             score  = -(keep_orig ? initial_neg : neg);
+
+            if (checking()) {
+                // old local partials at the same candidate, combined at both lengths
+                buildDownwardLocal(node2, node1, downChild);
+                buildUpToCLocal(node1, node2, downChild, upParent);
+                std::vector<double> new_ptn(nptn), old_ptn(nptn);
+                for (double len : {orig_central_len, optlen}) {
+                    combineTape(tape_nni_up, tape_nni_down, len, new_ptn.data());
+                    combineVectors(upParent, downChild, len, old_ptn.data());
+                    checkTapes("nni", new_ptn.data(), old_ptn.data());
+                }
+            }
         } else {
             central->length = central_back->length = orig_central_len;
             score = computeLikelihood();
@@ -1774,4 +1875,779 @@ double PhyloTreeSciPhy::clockLBFGS() {
     clock_lbfgs_active = false;
     clockSetVars(x.data());
     return computeLikelihood();
+}
+
+// <----- Prefix-depth kernel ----->
+//
+// Every possible state of a tape at a node is a prefix of the longest common prefix of
+// the tip tapes below it, so a partial is (representative tip tape, depth d, d+1 numbers).
+// The transition from depth i to depth j over a branch with mean mu = clock * length is
+//   T(i, j) = Pois(j-i; mu) * F[j] / F[i]          (child not full)
+//   T(i, L) = P(K >= L-i; mu) * F[L] / F[i]        (child full: absorbing)
+// with F the prefix products of the representative's insert probabilities. The Poisson
+// table is built once per branch and shared by all tapes.
+
+namespace {
+
+typedef PhyloTreeSciPhy PTS;
+
+PhyloTreeSciPhy::SciPhyKernel kernelFromEnv() {
+    const char *k = std::getenv("IQTREE_SCIPHY_KERNEL");
+    if (!k) return PTS::SCIPHY_KERNEL_TAPE;
+    if (!strcmp(k, "old")) return PTS::SCIPHY_KERNEL_OLD;
+    if (!strcmp(k, "check")) return PTS::SCIPHY_KERNEL_CHECK;
+    if (!strcmp(k, "check-raw")) return PTS::SCIPHY_KERNEL_CHECK_RAW;
+    outError(std::string("IQTREE_SCIPHY_KERNEL must be 'old', 'check' or 'check-raw', not ") + k);
+    return PTS::SCIPHY_KERNEL_TAPE;
+}
+
+// Poisson(mu) pmf and upper tails for 0..L. Linear unless an entry would underflow
+// (extreme mu, e.g. Brent probes of the clock rate); then all entries are logs.
+struct BranchTable {
+    double pois[PTS::MAX_TAPE_SITES + 1];
+    double tail[PTS::MAX_TAPE_SITES + 1];   // tail[r] = P(K >= r), summed directly
+    bool log_space;
+};
+
+void makeBranchTable(double mu, int L, BranchTable &bt) {
+    bt.log_space = false;
+    if (!(mu > 0.0)) {
+        for (int m = 0; m <= L; ++m) bt.pois[m] = bt.tail[m] = 0.0;
+        bt.pois[0] = bt.tail[0] = 1.0;
+        return;
+    }
+    const double TINY = 1e-280;
+    if (mu < 600.0) {
+        bt.pois[0] = std::exp(-mu);
+        for (int m = 1; m <= L; ++m) bt.pois[m] = bt.pois[m - 1] * mu / m;
+        // pmf is unimodal: its smallest entry is at an end
+        if (bt.pois[0] > TINY && bt.pois[L] > TINY) {
+            double term = bt.pois[L], far = 0.0;
+            for (int m = L + 1; ; ++m) {
+                term *= mu / m;
+                far += term;
+                if (m > mu && term <= 1e-17 * far) break;
+            }
+            bt.tail[L] = far + bt.pois[L];
+            for (int r = L - 1; r >= 1; --r) bt.tail[r] = bt.tail[r + 1] + bt.pois[r];
+            bt.tail[0] = 1.0;
+            return;
+        }
+    }
+    bt.log_space = true;
+    const double lmu = std::log(mu);
+    for (int m = 0; m <= L; ++m) bt.pois[m] = m * lmu - mu - std::lgamma(m + 1.0);
+    double lterm = bt.pois[L], far = -std::numeric_limits<double>::infinity();
+    for (int m = L + 1; ; ++m) {
+        lterm += lmu - std::log((double)m);
+        far = logAdd(far, lterm);
+        if (m > mu && lterm < far - 40.0) break;
+    }
+    bt.tail[L] = logAdd(far, bt.pois[L]);
+    for (int r = L - 1; r >= 1; --r) bt.tail[r] = logAdd(bt.tail[r + 1], bt.pois[r]);
+    bt.tail[0] = 0.0;
+}
+
+// linear results below this are recomputed in log space (exact, like the old kernel)
+const double LH_UNDERFLOW = 1e-290;
+
+// log of T(i, j) without the insert factor
+inline double logPoisTerm(const BranchTable &bt, int L, int i, int j) {
+    const double x = (j == L) ? bt.tail[L - i] : bt.pois[j - i];
+    return bt.log_space ? x : std::log(x);
+}
+
+// exp(lv - max) into out; returns max (-inf, and out = 0, if every entry is -inf)
+double fromLogs(const double *lv, int n, double *out) {
+    double mx = -std::numeric_limits<double>::infinity();
+    for (int k = 0; k < n; ++k) if (lv[k] > mx) mx = lv[k];
+    for (int k = 0; k < n; ++k)
+        out[k] = (mx == -std::numeric_limits<double>::infinity()) ? 0.0 : std::exp(lv[k] - mx);
+    return mx;
+}
+
+// lv[i] = log sum_{j=i..dc} T(i,j) child[j], i = 0..dp
+void transDownLogs(const BranchTable &bt, int L, const double *F, const unsigned char *Z,
+                   const double *child, int dc, int dp, double *lv) {
+    for (int i = 0; i <= dp; ++i) {
+        double lse = -std::numeric_limits<double>::infinity();
+        for (int j = i; j <= dc && Z[j] == Z[i]; ++j) {
+            if (child[j] <= 0.0) continue;
+            lse = logAdd(lse, logPoisTerm(bt, L, i, j) + std::log(F[j]) - std::log(F[i])
+                              + std::log(child[j]));
+        }
+        lv[i] = lse;
+    }
+}
+
+// lv[j] = log sum_{i=0..min(j,du)} up[i] T(i,j), j = 0..dc
+void transUpLogs(const BranchTable &bt, int L, const double *F, const unsigned char *Z,
+                 const double *up, int du, int dc, double *lv) {
+    for (int j = 0; j <= dc; ++j) {
+        double lse = -std::numeric_limits<double>::infinity();
+        for (int i = std::min(j, du); i >= 0 && Z[i] == Z[j]; --i) {
+            if (up[i] <= 0.0) continue;
+            lse = logAdd(lse, logPoisTerm(bt, L, i, j) + std::log(F[j]) - std::log(F[i])
+                              + std::log(up[i]));
+        }
+        lv[j] = lse;
+    }
+}
+
+// out[i] = sum_{j=i..dc} T(i,j) child[j] for i = 0..dp (dp <= dc), times exp(-returned shift).
+// F, Z: prefix products / zero counts of the child's representative tape of length L.
+double transDown(const BranchTable &bt, int L, const double *F, const unsigned char *Z,
+                 const double *child, int dc, int dp, double *out) {
+    if (bt.log_space) {
+        double lv[PTS::MAX_TAPE_SITES + 1];
+        transDownLogs(bt, L, F, Z, child, dc, dp, lv);
+        return fromLogs(lv, dp + 1, out);
+    }
+    double g[PTS::MAX_TAPE_SITES + 1];
+    for (int j = 0; j <= dc; ++j) g[j] = F[j] * child[j];
+    const int jp = (dc == L) ? L - 1 : dc;   // last non-full child state
+    for (int i = 0; i <= dp; ++i) {
+        double s = 0.0;
+        int j = i;
+        for (; j <= jp && Z[j] == Z[i]; ++j) s += bt.pois[j - i] * g[j];
+        if (dc == L && j == L && Z[L] == Z[i]) s += bt.tail[L - i] * g[L];
+        out[i] = s / F[i];
+    }
+    return 0.0;
+}
+
+// out[j] = sum_{i=0..min(j,du)} up[i] T(i,j) for j = 0..dc, times exp(-returned shift).
+double transUp(const BranchTable &bt, int L, const double *F, const unsigned char *Z,
+               const double *up, int du, int dc, double *out) {
+    if (bt.log_space) {
+        double lv[PTS::MAX_TAPE_SITES + 1];
+        transUpLogs(bt, L, F, Z, up, du, dc, lv);
+        return fromLogs(lv, dc + 1, out);
+    }
+    double h[PTS::MAX_TAPE_SITES + 1];
+    for (int i = 0; i <= du; ++i) h[i] = up[i] / F[i];
+    for (int j = 0; j <= dc; ++j) {
+        const double *P = (j == L) ? bt.tail + L : bt.pois + j;   // P[-i]
+        double s = 0.0;
+        for (int i = std::min(j, du); i >= 0 && Z[i] == Z[j]; --i) s += h[i] * P[-i];
+        out[j] = s * F[j];
+    }
+    return 0.0;
+}
+
+// lh[0..d] /= max; returns log(max), -inf if all zero
+double normalizeTape(double *lh, int d) {
+    double mx = 0.0;
+    for (int k = 0; k <= d; ++k) if (lh[k] > mx) mx = lh[k];
+    if (!(mx > 0.0)) return -std::numeric_limits<double>::infinity();
+    const double inv = 1.0 / mx;
+    for (int k = 0; k <= d; ++k) lh[k] *= inv;
+    return std::log(mx);
+}
+
+// log(sum lh) + log_scale (just log_scale for a wildcard)
+double totalTapeMass(const SciPhyTapeHead &h, const double *lh) {
+    if (h.wildcard) return h.log_scale;
+    double s = 0.0;
+    for (int k = 0; k <= h.depth; ++k) if (lh[k] > 0.0) s += lh[k];
+    return (s > 0.0) ? std::log(s) + h.log_scale : -std::numeric_limits<double>::infinity();
+}
+
+void setWildcard(SciPhyTapeHead &h, double log_scale) {
+    h.wildcard = true;
+    h.rep = -1;
+    h.depth = -1;
+    h.log_scale = log_scale;
+}
+
+}  // anonymous namespace
+
+bool PhyloTreeSciPhy::hasPartial(PhyloNeighbor *nei) const {
+    return useOldKernel() ? nei->sciphy_partial != nullptr : nei->sciphy_tape_partial != nullptr;
+}
+
+void PhyloTreeSciPhy::initTapeKernel() {
+    if (!tape_lh_offset.empty()) return;
+    const BarcodeAlignment *barcode_aln = static_cast<const BarcodeAlignment*>(aln);
+    const ModelSciPhy *sm = static_cast<const ModelSciPhy*>(model);
+    const size_t nptn = aln->getNPattern();
+
+    // tape length per pattern, from any observed cell
+    tape_len.assign(nptn, 0);
+    tape_lh_offset.assign(nptn + 1, 0);
+    max_tape_len = 0;
+    for (size_t p = 0; p < nptn; ++p) {
+        for (size_t c = 0; c < aln->getNSeq(); ++c) {
+            const int obs = (int)aln->at(p)[c];
+            if (obs >= 0 && obs < barcode_aln->getNumTapeStates()) {
+                tape_len[p] = (int)barcode_aln->getTapeVec(obs).size();
+                break;
+            }
+        }
+        if (tape_len[p] > MAX_TAPE_SITES)
+            outError("SciPhy: tapes longer than " + convertIntToString(MAX_TAPE_SITES) +
+                     " sites are not supported");
+        max_tape_len = std::max(max_tape_len, tape_len[p]);
+        tape_lh_offset[p + 1] = tape_lh_offset[p] + tape_len[p] + 1;
+    }
+
+    // insert-probability prefix products per tip tape state (same factor as logTransProbVec)
+    const int nstates = barcode_aln->getNumTapeStates();
+    const int M = std::max(1, barcode_aln->getMaxInsertionType());
+    const std::vector<double> &edit_probs = sm->getEditProbs();
+    prefix_offset.assign(nstates + 1, 0);
+    prefix_prod.clear();
+    prefix_zeros.clear();
+    for (int s = 0; s < nstates; ++s) {
+        prefix_prod.push_back(1.0);
+        prefix_zeros.push_back(0);
+        for (int scar : barcode_aln->getTapeVec(s)) {
+            if (scar == 0) continue;
+            double pe = 0.0;
+            if (scar >= 1 && scar <= M)
+                pe = (scar - 1 < (int)edit_probs.size()) ? edit_probs[scar - 1] : 1.0 / M;
+            const bool zero = !(pe > 0.0);
+            prefix_prod.push_back(prefix_prod.back() * (zero ? 1.0 : pe));
+            prefix_zeros.push_back(prefix_zeros.back() + (zero ? 1 : 0));
+        }
+        prefix_offset[s + 1] = prefix_prod.size();
+    }
+}
+
+int PhyloTreeSciPhy::commonDepth(int a, int b, int bound) const {
+    if (a == b) return bound;
+    const BarcodeAlignment *barcode_aln = static_cast<const BarcodeAlignment*>(aln);
+    const std::vector<int> &u = barcode_aln->getTapeVec(a);
+    const std::vector<int> &v = barcode_aln->getTapeVec(b);
+    // prefixes agree up to the first site where the tapes differ
+    int k = 0;
+    for (size_t q = 0; q < u.size() && k < bound; ++q) {
+        if (u[q] != v[q]) break;
+        if (u[q] != 0) ++k;
+    }
+    return k;
+}
+
+void PhyloTreeSciPhy::sizeTapePartials(SciPhyTapePartials &tp) const {
+    tp.head.resize(aln->getNPattern());
+    tp.lh.resize(tape_lh_offset.back());
+}
+
+SciPhyTapePartials &PhyloTreeSciPhy::tapePartials(PhyloNeighbor *nei) const {
+    if (!nei->sciphy_tape_partial) nei->sciphy_tape_partial = new SciPhyTapePartials();
+    sizeTapePartials(*nei->sciphy_tape_partial);
+    return *nei->sciphy_tape_partial;
+}
+
+// Post-order: cache Down(subtree) on dad_branch->sciphy_tape_partial.
+void PhyloTreeSciPhy::computeTapeDownward(PhyloNeighbor *dad_branch, PhyloNode *dad) {
+    if (dad_branch->partial_lh_computed & 1) {
+        return;
+    }
+    PhyloNode *node = (PhyloNode*) dad_branch->node;
+    const int nptn = (int)aln->getNPattern();
+    SciPhyTapePartials &out = tapePartials(dad_branch);
+
+    if (node->isLeaf()) {
+        // Dropout tip weights (constants): dropped -> q, observed -> 1-q; 1 if q unset.
+        const ModelSciPhy *sm = static_cast<const ModelSciPhy*>(model);
+        const bool use_q = sm->hasDropoutProb();
+        const double log_q   = use_q ? std::log(sm->getDropoutProb()) : 0.0;
+        const double log_1mq = use_q ? std::log(1.0 - sm->getDropoutProb()) : 0.0;
+        const int nstates = static_cast<const BarcodeAlignment*>(aln)->getNumTapeStates();
+        for (int p = 0; p < nptn; ++p) {
+            SciPhyTapeHead &h = out.head[p];
+            const int obs = getObservedLeafState(node, p);
+            if (obs == aln->STATE_UNKNOWN || obs < 0 || obs >= nstates) {
+                setWildcard(h, log_q);   // dropped tape: present, identity unknown
+                continue;
+            }
+            h.wildcard = false;
+            h.rep = obs;
+            h.depth = stateDepth(obs);
+            h.log_scale = log_1mq;
+            double *lh = &out.lh[tape_lh_offset[p]];
+            for (int k = 0; k <= h.depth; ++k) lh[k] = (k == h.depth) ? 1.0 : 0.0;
+        }
+        dad_branch->partial_lh_computed |= 1;
+        return;
+    }
+
+    std::vector<PhyloNeighbor*> kids;
+    FOR_NEIGHBOR_IT(node, dad, it) {
+        computeTapeDownward((PhyloNeighbor*) *it, node);
+        kids.push_back((PhyloNeighbor*) *it);
+    }
+    if (!kids.empty()) combineTapeChildren(kids, out);
+    dad_branch->partial_lh_computed |= 1;
+}
+
+void PhyloTreeSciPhy::combineTapeChildren(const std::vector<PhyloNeighbor*> &kids,
+                                          SciPhyTapePartials &out) {
+    const int nptn = (int)aln->getNPattern();
+    const double lambda = static_cast<const ModelSciPhy*>(model)->getClockRate();
+
+    // support: prefixes of the observed children's common prefix; wildcard children
+    // don't constrain it and add only a constant
+    for (int p = 0; p < nptn; ++p) {
+        SciPhyTapeHead &h = out.head[p];
+        double scale = 0.0;
+        int rep = -1, depth = -1;
+        for (PhyloNeighbor *k : kids) {
+            const SciPhyTapeHead &c = k->sciphy_tape_partial->head[p];
+            scale += c.log_scale;
+            if (c.wildcard) continue;
+            if (rep < 0) { rep = c.rep; depth = c.depth; }
+            else depth = commonDepth(rep, c.rep, std::min(depth, (int)c.depth));
+        }
+        if (rep < 0) { setWildcard(h, scale); continue; }
+        h.wildcard = false;
+        h.rep = rep;
+        h.depth = depth;
+        h.log_scale = scale;
+        double *lh = &out.lh[tape_lh_offset[p]];
+        for (int k = 0; k <= depth; ++k) lh[k] = 1.0;
+    }
+
+    // one Poisson table per child branch, shared by all tapes
+    tape_redo.assign(nptn, 0);
+    for (PhyloNeighbor *k : kids) {
+        BranchTable bt;
+        makeBranchTable(std::max(0.0, lambda * k->length), max_tape_len, bt);
+        const SciPhyTapePartials &cp = *k->sciphy_tape_partial;
+#pragma omp parallel for schedule(static) num_threads(num_threads) if (num_threads > 1)
+        for (int p = 0; p < nptn; ++p) {
+            SciPhyTapeHead &h = out.head[p];
+            const SciPhyTapeHead &c = cp.head[p];
+            if (h.wildcard || c.wildcard || tape_redo[p]) continue;
+            double v[MAX_TAPE_SITES + 1];
+            h.log_scale += transDown(bt, tape_len[p], prefixProd(c.rep), prefixZeros(c.rep),
+                                     &cp.lh[tape_lh_offset[p]], c.depth, h.depth, v);
+            double *lh = &out.lh[tape_lh_offset[p]];
+            double mx = 0.0;
+            for (int i = 0; i <= h.depth; ++i) { lh[i] *= v[i]; mx = std::max(mx, lh[i]); }
+            if (mx < LH_UNDERFLOW) tape_redo[p] = 1;
+            else if (mx < 1e-150) h.log_scale += normalizeTape(lh, h.depth);
+        }
+    }
+
+    for (int p = 0; p < nptn; ++p) {
+        SciPhyTapeHead &h = out.head[p];
+        if (h.wildcard) continue;
+        double *lh = &out.lh[tape_lh_offset[p]];
+        if (!tape_redo[p]) {
+            h.log_scale += normalizeTape(lh, h.depth);
+            continue;
+        }
+        h.log_scale = 0.0;
+        for (PhyloNeighbor *k : kids) h.log_scale += k->sciphy_tape_partial->head[p].log_scale;
+        h.log_scale += tapeLogs(p, h.rep, h.depth, nullptr, 0, 0.0, kids, nullptr, lh);
+    }
+}
+
+double PhyloTreeSciPhy::tapeLogs(int p, int rep, int depth, const SciPhyTapePartials *up,
+                                 int up_depth, double up_len,
+                                 const std::vector<PhyloNeighbor*> &kids,
+                                 const PhyloNeighbor *skip, double *lh) const {
+    const double lambda = static_cast<const ModelSciPhy*>(model)->getClockRate();
+    const int L = tape_len[p];
+    const size_t off = tape_lh_offset[p];
+    double acc[MAX_TAPE_SITES + 1], lv[MAX_TAPE_SITES + 1];
+    for (int s = 0; s <= depth; ++s) acc[s] = 0.0;
+    if (up) {
+        BranchTable bt;
+        makeBranchTable(std::max(0.0, lambda * up_len), max_tape_len, bt);
+        transUpLogs(bt, L, prefixProd(rep), prefixZeros(rep), &up->lh[off],
+                    std::min(up_depth, depth), depth, lv);
+        for (int s = 0; s <= depth; ++s) acc[s] += lv[s];
+    }
+    for (PhyloNeighbor *k : kids) {
+        if (k == skip) continue;
+        const SciPhyTapePartials &cp = *k->sciphy_tape_partial;
+        const SciPhyTapeHead &c = cp.head[p];
+        if (c.wildcard) continue;
+        BranchTable bt;
+        makeBranchTable(std::max(0.0, lambda * k->length), max_tape_len, bt);
+        transDownLogs(bt, L, prefixProd(c.rep), prefixZeros(c.rep), &cp.lh[off], c.depth, depth, lv);
+        for (int s = 0; s <= depth; ++s) acc[s] += lv[s];
+    }
+    return fromLogs(acc, depth + 1, lh);
+}
+
+void PhyloTreeSciPhy::computeTapeFullUpward() {
+    if (!rooted || !root || root->neighbors.empty()) return;
+    PhyloNode *root_node = (PhyloNode*) root;
+    PhyloNeighbor *origin_edge = (PhyloNeighbor*) root->neighbors[0];   // Down(root_int)
+    PhyloNode *root_int = (PhyloNode*) origin_edge->node;
+    if (!origin_edge->sciphy_tape_partial) return;                     // downward must exist
+    const SciPhyTapePartials &downRoot = *origin_edge->sciphy_tape_partial;
+
+    // Seed UpToC(founder) on (root_int -> root): founder = unedited (depth 0), mass 1.
+    SciPhyTapePartials &seed = tapePartials((PhyloNeighbor*) root_int->findNeighbor(root_node));
+    for (size_t p = 0; p < aln->getNPattern(); ++p) {
+        SciPhyTapeHead &h = seed.head[p];
+        h.wildcard = false;
+        h.rep = downRoot.head[p].rep;
+        h.depth = 0;
+        h.log_scale = 0.0;
+        seed.lh[tape_lh_offset[p]] = 1.0;
+    }
+    computeTapeUpward(root_int, root_node);
+    sciphy_snapshot_valid = true;
+}
+
+// Pre-order: cache UpToC(node) on each (child -> node) half-edge below `node`.
+void PhyloTreeSciPhy::computeTapeUpward(PhyloNode *node, PhyloNode *dad) {
+    const int nptn = (int)aln->getNPattern();
+    const double lambda = static_cast<const ModelSciPhy*>(model)->getClockRate();
+
+    //   up_nei   = (node -> dad): holds UpToC(dad)   [function of dad's state]
+    //   down_nei = (dad -> node): holds Down(node)   [function of node's state]
+    PhyloNeighbor *up_nei   = (PhyloNeighbor*) node->findNeighbor(dad);
+    PhyloNeighbor *down_nei = (PhyloNeighbor*) dad->findNeighbor(node);
+    if (!up_nei->sciphy_tape_partial || !down_nei->sciphy_tape_partial) return;
+    const SciPhyTapePartials &upToDad  = *up_nei->sciphy_tape_partial;
+    const SciPhyTapePartials &downNode = *down_nei->sciphy_tape_partial;
+
+    // UpBar(node)[s] = sum_{s_dad} UpToC(dad)[s_dad] * T(s_dad -> s), s in Down(node)'s support
+    SciPhyTapePartials &ub = tape_upbar;
+    sizeTapePartials(ub);
+    {
+        BranchTable bt;
+        makeBranchTable(std::max(0.0, lambda * down_nei->length), max_tape_len, bt);
+        for (int p = 0; p < nptn; ++p) {
+            const SciPhyTapeHead &ud = upToDad.head[p];
+            const SciPhyTapeHead &dn = downNode.head[p];
+            SciPhyTapeHead &h = ub.head[p];
+            const size_t off = tape_lh_offset[p];
+            // all-missing subtree or uninformative up side: collapses to the total up mass
+            if (dn.wildcard || ud.wildcard) {
+                setWildcard(h, totalTapeMass(ud, &upToDad.lh[off]));
+                continue;
+            }
+            h.wildcard = false;
+            h.rep = dn.rep;
+            h.depth = dn.depth;
+            h.log_scale = ud.log_scale;
+            const double shift = transUp(bt, tape_len[p], prefixProd(dn.rep), prefixZeros(dn.rep),
+                                         &upToDad.lh[off], std::min(ud.depth, dn.depth), dn.depth, &ub.lh[off]);
+            const double lmax = normalizeTape(&ub.lh[off], h.depth);
+            if (lmax < std::log(LH_UNDERFLOW))
+                h.log_scale += tapeLogs(p, dn.rep, dn.depth, &upToDad, ud.depth, down_nei->length,
+                                        std::vector<PhyloNeighbor*>(), nullptr, &ub.lh[off]);
+            else
+                h.log_scale += shift + lmax;
+        }
+    }
+
+    std::vector<PhyloNeighbor*> childDown;
+    std::vector<PhyloNode*> childNode;
+    FOR_NEIGHBOR_IT(node, dad, it) {
+        childDown.push_back((PhyloNeighbor*) *it);
+        childNode.push_back((PhyloNode*) (*it)->node);
+    }
+
+    // UpToC(node) for child c = UpBar(node) * prod_{siblings d} sum_{s_d} T * Down(d),
+    // stored on (c -> node). All children first: the recursion reuses the UpBar scratch.
+    for (size_t ci = 0; ci < childDown.size(); ++ci) {
+        PhyloNeighbor *c_up = (PhyloNeighbor*) childNode[ci]->findNeighbor(node);
+        SciPhyTapePartials &out = tapePartials(c_up);
+        out.head = ub.head;
+        out.lh = ub.lh;
+        tape_redo.assign(nptn, 0);
+        for (size_t di = 0; di < childDown.size(); ++di) {
+            if (di == ci) continue;
+            const SciPhyTapePartials &dd = *childDown[di]->sciphy_tape_partial;
+            BranchTable bt;
+            makeBranchTable(std::max(0.0, lambda * childDown[di]->length), max_tape_len, bt);
+            for (int p = 0; p < nptn; ++p) {
+                SciPhyTapeHead &h = out.head[p];
+                const SciPhyTapeHead &d = dd.head[p];
+                h.log_scale += d.log_scale;   // constant UpBar folds in all sibling constants
+                if (h.wildcard || d.wildcard || tape_redo[p]) continue;
+                const size_t off = tape_lh_offset[p];
+                double v[MAX_TAPE_SITES + 1];
+                h.log_scale += transDown(bt, tape_len[p], prefixProd(d.rep), prefixZeros(d.rep),
+                                         &dd.lh[off], d.depth, h.depth, v);
+                double *lh = &out.lh[off];
+                double mx = 0.0;
+                for (int i = 0; i <= h.depth; ++i) { lh[i] *= v[i]; mx = std::max(mx, lh[i]); }
+                if (mx < LH_UNDERFLOW) tape_redo[p] = 1;
+                else if (mx < 1e-150) h.log_scale += normalizeTape(lh, h.depth);
+            }
+        }
+        for (int p = 0; p < nptn; ++p) {
+            SciPhyTapeHead &h = out.head[p];
+            if (h.wildcard) continue;
+            double *lh = &out.lh[tape_lh_offset[p]];
+            if (!tape_redo[p]) {
+                h.log_scale += normalizeTape(lh, h.depth);
+                continue;
+            }
+            h.log_scale = upToDad.head[p].log_scale;
+            for (size_t di = 0; di < childDown.size(); ++di)
+                if (di != ci) h.log_scale += childDown[di]->sciphy_tape_partial->head[p].log_scale;
+            h.log_scale += tapeLogs(p, h.rep, h.depth, &upToDad, upToDad.head[p].depth,
+                                    down_nei->length, childDown, childDown[ci], lh);
+        }
+        c_up->partial_lh_computed |= 1;
+    }
+    for (size_t ci = 0; ci < childNode.size(); ++ci)
+        computeTapeUpward(childNode[ci], node);
+}
+
+// Whole-tree logL from an up partial (parent state) and a down partial (child state)
+// joined by a branch of length len.
+double PhyloTreeSciPhy::combineTape(const SciPhyTapePartials &up, const SciPhyTapePartials &down,
+                                    double len, double *pattern_lh_out) const {
+    const size_t nptn = aln->getNPattern();
+    const double NEG_INF = -std::numeric_limits<double>::infinity();
+    if (up.head.size() != nptn || down.head.size() != nptn) {
+        return NEG_INF;
+    }
+    BranchTable bt;
+    makeBranchTable(std::max(0.0, static_cast<const ModelSciPhy*>(model)->getClockRate() * len),
+                    max_tape_len, bt);
+    double tree_lh = 0.0;
+    for (size_t p = 0; p < nptn; ++p) {
+        const SciPhyTapeHead &uc = up.head[p];     // s_parent
+        const SciPhyTapeHead &dc = down.head[p];   // s_child
+        const size_t off = tape_lh_offset[p];
+        double lp;
+        if (uc.wildcard && dc.wildcard) {
+            lp = uc.log_scale + dc.log_scale;
+        } else if (dc.wildcard) {
+            // child side all missing: marginalize the up side
+            lp = totalTapeMass(uc, &up.lh[off]) + dc.log_scale;
+        } else if (uc.wildcard) {
+            // up side uninformative (normally not reached): marginalize the down side
+            lp = totalTapeMass(dc, &down.lh[off]) + uc.log_scale;
+        } else {
+            // parent states deeper than the child's support have T = 0
+            const int dp = std::min(uc.depth, dc.depth);
+            double v[MAX_TAPE_SITES + 1];
+            const double shift = transDown(bt, tape_len[p], prefixProd(dc.rep), prefixZeros(dc.rep),
+                                           &down.lh[off], dc.depth, dp, v);
+            double s = 0.0;
+            for (int i = 0; i <= dp; ++i) s += up.lh[off + i] * v[i];
+            if (s >= LH_UNDERFLOW) {
+                lp = std::log(s) + shift + uc.log_scale + dc.log_scale;
+            } else {
+                double lv[MAX_TAPE_SITES + 1];
+                transDownLogs(bt, tape_len[p], prefixProd(dc.rep), prefixZeros(dc.rep),
+                              &down.lh[off], dc.depth, dp, lv);
+                double lse = NEG_INF;
+                for (int i = 0; i <= dp; ++i)
+                    if (up.lh[off + i] > 0.0) lse = logAdd(lse, std::log(up.lh[off + i]) + lv[i]);
+                lp = (lse == NEG_INF) ? NEG_INF : lse + uc.log_scale + dc.log_scale;
+            }
+        }
+        if (pattern_lh_out) pattern_lh_out[p] = lp;
+        tree_lh += lp * ptn_freq[p];
+    }
+    return tree_lh;
+}
+
+// Founder (unedited, depth 0) -> root_int over the origin branch of length t.
+double PhyloTreeSciPhy::originClosureTape(const SciPhyTapePartials &bio, double t,
+                                          double *pattern_lh_out) {
+    const int nptn = (int)aln->getNPattern();
+    const double NEG_INF = -std::numeric_limits<double>::infinity();
+    BranchTable bt;
+    makeBranchTable(std::max(0.0, static_cast<const ModelSciPhy*>(model)->getClockRate() *
+                                  std::max(0.0, t)), max_tape_len, bt);
+    double tree_lh = 0.0;
+#pragma omp parallel for schedule(static) num_threads(num_threads) if (num_threads > 1) reduction(+: tree_lh)
+    for (int p = 0; p < nptn; ++p) {
+        const SciPhyTapeHead &b = bio.head[p];
+        double lp;
+        if (b.wildcard) {
+            lp = b.log_scale;   // tape dropped in every cell: only the dropout constant
+        } else {
+            double v[MAX_TAPE_SITES + 1];
+            const double shift = transDown(bt, tape_len[p], prefixProd(b.rep), prefixZeros(b.rep),
+                                           &bio.lh[tape_lh_offset[p]], b.depth, 0, v);
+            if (v[0] >= LH_UNDERFLOW) {
+                lp = std::log(v[0]) + shift + b.log_scale;
+            } else {
+                double lv[MAX_TAPE_SITES + 1];
+                transDownLogs(bt, tape_len[p], prefixProd(b.rep), prefixZeros(b.rep),
+                              &bio.lh[tape_lh_offset[p]], b.depth, 0, lv);
+                lp = (lv[0] == NEG_INF) ? NEG_INF : lv[0] + b.log_scale;
+            }
+        }
+        if (pattern_lh_out) pattern_lh_out[p] = lp;
+        tree_lh += lp * ptn_freq[p];
+    }
+    return tree_lh;
+}
+
+void PhyloTreeSciPhy::buildTapeDownwardLocal(PhyloNode *child, PhyloNode *parent,
+                                             SciPhyTapePartials &out) {
+    std::vector<PhyloNeighbor*> kids;
+    FOR_NEIGHBOR_IT(child, parent, it) kids.push_back((PhyloNeighbor*) *it);
+    out.head.clear();
+    if (kids.empty()) return;
+    for (PhyloNeighbor *k : kids)
+        if (!k->sciphy_tape_partial) return;   // cache miss
+    sizeTapePartials(out);
+    combineTapeChildren(kids, out);
+}
+
+void PhyloTreeSciPhy::buildTapeUpToCLocal(PhyloNode *parent, PhyloNode *child,
+                                          const SciPhyTapePartials &child_down,
+                                          SciPhyTapePartials &out) {
+    const int nptn = (int)aln->getNPattern();
+    const double lambda = static_cast<const ModelSciPhy*>(model)->getClockRate();
+    out.head.clear();
+
+    // parent's toward-root half-edge holds UpToC(grandparent or founder)
+    PhyloNeighbor *pnei = nullptr;
+    FOR_NEIGHBOR_IT(parent, nullptr, it)
+        if (((PhyloNeighbor*) *it)->direction == TOWARD_ROOT) { pnei = (PhyloNeighbor*) *it; break; }
+    if (!pnei || !pnei->sciphy_tape_partial) return;
+    const SciPhyTapePartials &upP = *pnei->sciphy_tape_partial;
+
+    // parent's children: `child` plus its siblings
+    std::vector<PhyloNeighbor*> kids;
+    PhyloNeighbor *child_nei = nullptr;
+    FOR_NEIGHBOR_IT(parent, nullptr, it) {
+        PhyloNeighbor *k = (PhyloNeighbor*) *it;
+        if (k == pnei) continue;
+        kids.push_back(k);
+        if (k->node == child) child_nei = k;
+    }
+    if (kids.empty() || !child_nei || (int)child_down.head.size() != nptn) return;
+    for (PhyloNeighbor *k : kids)
+        if (!k->sciphy_tape_partial) return;
+    auto kidHead = [&](PhyloNeighbor *k, int p) -> const SciPhyTapeHead & {
+        return (k == child_nei) ? child_down.head[p] : k->sciphy_tape_partial->head[p];
+    };
+    sizeTapePartials(out);
+
+    // support from the observed kids; all-missing (or uninformative up side) -> constant
+    for (int p = 0; p < nptn; ++p) {
+        SciPhyTapeHead &h = out.head[p];
+        const SciPhyTapeHead &uP = upP.head[p];
+        int rep = -1, depth = -1;
+        for (PhyloNeighbor *k : kids) {
+            const SciPhyTapeHead &c = kidHead(k, p);
+            if (c.wildcard) continue;
+            if (rep < 0) { rep = c.rep; depth = c.depth; }
+            else depth = commonDepth(rep, c.rep, std::min(depth, (int)c.depth));
+        }
+        if (uP.wildcard || rep < 0) {
+            double ls = totalTapeMass(uP, &upP.lh[tape_lh_offset[p]]);
+            for (PhyloNeighbor *k : kids) {
+                const SciPhyTapeHead &d = k->sciphy_tape_partial->head[p];
+                if (k != child_nei && d.wildcard) ls += d.log_scale;
+            }
+            setWildcard(h, ls);
+            continue;
+        }
+        h.wildcard = false;
+        h.rep = rep;
+        h.depth = depth;
+        h.log_scale = uP.log_scale;
+    }
+
+    // UpBar(parent), then times each sibling's down contribution
+    tape_redo.assign(nptn, 0);
+    {
+        BranchTable bt;
+        makeBranchTable(std::max(0.0, lambda * pnei->length), max_tape_len, bt);
+        for (int p = 0; p < nptn; ++p) {
+            SciPhyTapeHead &h = out.head[p];
+            if (h.wildcard) continue;
+            const SciPhyTapeHead &uP = upP.head[p];
+            const size_t off = tape_lh_offset[p];
+            h.log_scale += transUp(bt, tape_len[p], prefixProd(h.rep), prefixZeros(h.rep),
+                                   &upP.lh[off], std::min((int)uP.depth, (int)h.depth), h.depth, &out.lh[off]);
+            const double lmax = normalizeTape(&out.lh[off], h.depth);
+            if (lmax < std::log(LH_UNDERFLOW)) tape_redo[p] = 1;
+            else h.log_scale += lmax;
+        }
+    }
+    for (PhyloNeighbor *k : kids) {
+        if (k == child_nei) continue;
+        const SciPhyTapePartials &dd = *k->sciphy_tape_partial;
+        BranchTable bt;
+        makeBranchTable(std::max(0.0, lambda * k->length), max_tape_len, bt);
+        for (int p = 0; p < nptn; ++p) {
+            SciPhyTapeHead &h = out.head[p];
+            const SciPhyTapeHead &d = dd.head[p];
+            if (h.wildcard) continue;
+            h.log_scale += d.log_scale;
+            if (d.wildcard || tape_redo[p]) continue;
+            const size_t off = tape_lh_offset[p];
+            double v[MAX_TAPE_SITES + 1];
+            h.log_scale += transDown(bt, tape_len[p], prefixProd(d.rep), prefixZeros(d.rep),
+                                     &dd.lh[off], d.depth, h.depth, v);
+            double *lh = &out.lh[off];
+            double mx = 0.0;
+            for (int i = 0; i <= h.depth; ++i) { lh[i] *= v[i]; mx = std::max(mx, lh[i]); }
+            if (mx < LH_UNDERFLOW) tape_redo[p] = 1;
+            else if (mx < 1e-150) h.log_scale += normalizeTape(lh, h.depth);
+        }
+    }
+    for (int p = 0; p < nptn; ++p) {
+        SciPhyTapeHead &h = out.head[p];
+        if (h.wildcard) continue;
+        double *lh = &out.lh[tape_lh_offset[p]];
+        if (!tape_redo[p]) {
+            h.log_scale += normalizeTape(lh, h.depth);
+            continue;
+        }
+        h.log_scale = upP.head[p].log_scale;
+        for (PhyloNeighbor *k : kids)
+            if (k != child_nei) h.log_scale += k->sciphy_tape_partial->head[p].log_scale;
+        h.log_scale += tapeLogs(p, h.rep, h.depth, &upP, upP.head[p].depth, pnei->length,
+                                kids, child_nei, lh);
+    }
+}
+
+// <----- Check mode (IQTREE_SCIPHY_KERNEL=check) ----->
+
+void PhyloTreeSciPhy::checkTapes(const char *where, const double *ptn_new, const double *ptn_old) {
+    CheckStats &st = check_stats[where];
+    for (size_t p = 0; p < aln->getNPattern(); ++p) {
+        const double a = ptn_new[p], b = ptn_old[p];
+        double rel;
+        if (a == b) rel = 0.0;
+        else if (std::isinf(a) || std::isinf(b) || std::isnan(a) || std::isnan(b))
+            rel = std::numeric_limits<double>::infinity();
+        else rel = std::fabs(a - b) / std::max(std::fabs(b), 1.0);
+        ++st.n;
+        st.max_rel = std::max(st.max_rel, rel);
+        if (rel > 1e-10) {
+            if (++st.fail <= 20)
+                std::cerr << std::setprecision(17) << "[sciphy kernel check] " << where
+                          << " tape " << p << ": new=" << a << " old=" << b
+                          << " rel=" << rel << std::endl;
+        }
+    }
+}
+
+// combine at every branch with both kernels (validates the upward pass)
+void PhyloTreeSciPhy::checkAllBranches() {
+    NodeVector nodes, nodes2;
+    getBranches(nodes, nodes2);
+    const size_t nptn = aln->getNPattern();
+    std::vector<double> new_ptn(nptn), old_ptn(nptn);
+    for (size_t j = 0; j < nodes.size(); ++j) {
+        PhyloNode *n1 = (PhyloNode*) nodes[j], *n2 = (PhyloNode*) nodes2[j];
+        if (n1 == root || n2 == root) continue;
+        PhyloNeighbor *n12 = (PhyloNeighbor*) n1->findNeighbor(n2);
+        PhyloNode *parent = (n12->direction == TOWARD_ROOT) ? n2 : n1;
+        PhyloNode *child  = (n12->direction == TOWARD_ROOT) ? n1 : n2;
+        PhyloNeighbor *down_nei = (PhyloNeighbor*) parent->findNeighbor(child);
+        PhyloNeighbor *up_nei   = (PhyloNeighbor*) child->findNeighbor(parent);
+        if (!down_nei->sciphy_tape_partial || !up_nei->sciphy_tape_partial ||
+            !down_nei->sciphy_partial || !up_nei->sciphy_partial) continue;
+        combineTape(*up_nei->sciphy_tape_partial, *down_nei->sciphy_tape_partial,
+                    down_nei->length, new_ptn.data());
+        combineVectors(*up_nei->sciphy_partial, *down_nei->sciphy_partial,
+                       down_nei->length, old_ptn.data());
+        checkTapes("upward", new_ptn.data(), old_ptn.data());
+    }
 }
