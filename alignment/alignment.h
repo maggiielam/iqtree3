@@ -506,6 +506,9 @@ public:
     */
     virtual void checkAbsentStates(string msg);
 
+    /** true for SciPhy barcode alignments (one state per distinct tape; skips per-state checks) */
+    virtual bool isBarcodeAlignment() const { return false; }
+
     /**
             check proper and undupplicated sequence names
      */

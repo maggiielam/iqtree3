@@ -55,7 +55,11 @@ public:
         @param reversible TRUE (default) for reversible model, FALSE for non-reversible
         @param adapt_tree TRUE (default) to convert rooted<->unrooted tree
 	*/
-    ModelMarkov(PhyloTree *tree, bool reversible = true, bool adapt_tree = true);
+    ModelMarkov(PhyloTree *tree, bool reversible = true, bool adapt_tree = true, bool dense = true);
+
+    /** false: do not allocate the num_states^2 rate / eigen arrays (models with their own
+        likelihood, e.g. SciPhy, where num_states can be ~1e4-1e5) */
+    bool dense_matrices = true;
 
 	/**
 		@return TRUE if model is time-reversible, FALSE otherwise

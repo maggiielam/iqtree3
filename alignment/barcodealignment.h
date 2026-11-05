@@ -163,6 +163,11 @@ public:
      */
     int getNumTapeStates() const { return (int)tape_states.size(); }
 
+    virtual bool isBarcodeAlignment() const override { return true; }
+
+    /** no-op: per-state frequencies (O(nstates^2)) are not used by the SciPhy model */
+    virtual void checkAbsentStates(string msg) override { (void)msg; }
+
     /**
      * Empirical edit probabilities: frequency of each insert type 1..M over all
      * edited sites of all cells, plus a pseudocount alpha per type, normalized.

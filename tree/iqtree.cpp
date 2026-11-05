@@ -1755,6 +1755,43 @@ string IQTree::doRandomNNIs(bool storeTabu) {
     }
 
     initTabuSplits.clear();
+
+    // Fast path (rooted trees, uniform perturbation, no split filtering): build the inner-branch
+    // list once and update the two entries an NNI changes, instead of rescanning the tree for
+    // every random NNI (O(N^2) per perturbation). Same list, same order and same random draws
+    // as the loop below, so the perturbed tree is identical. On rooted trees getRandomNNI orients
+    // each branch by its direction, so the stored orientation does not matter.
+    if (rooted && !storeTabu && !params->fixStableSplits && !Params::getInstance().weightedPerturbation) {
+        getNNIBranches(initTabuSplits, candidateTrees.getCandSplits(), nonNNIBranches, nniBranches);
+        vector<pair<int, Branch>> list(nniBranches.begin(), nniBranches.end());   // sorted by key
+        auto key = [](Node *a, Node *b) { return pairInteger(a->id, b->id); };
+        auto erase = [&](Node *a, Node *b) {
+            auto it = lower_bound(list.begin(), list.end(), make_pair(key(a, b), Branch()),
+                                  [](const pair<int, Branch> &x, const pair<int, Branch> &y) { return x.first < y.first; });
+            if (it != list.end() && it->first == key(a, b)) list.erase(it);
+        };
+        auto insert = [&](Node *child, Node *parent) {   // same orientation as getNNIBranches
+            if (!isInnerBranch(child, parent)) return;
+            pair<int, Branch> e(key(child, parent), Branch(child, parent));
+            auto it = lower_bound(list.begin(), list.end(), e,
+                                  [](const pair<int, Branch> &x, const pair<int, Branch> &y) { return x.first < y.first; });
+            if (it == list.end() || it->first != e.first) list.insert(it, e);
+        };
+        while (cntNNI < numRandomNNI && !list.empty()) {
+            Branch br = list[random_int(static_cast<int>(list.size()))].second;
+            NNIMove randNNI = getRandomNNI(br);
+            if (constraintTree.isCompatible(randNNI)) {
+                Node *n1 = randNNI.node1, *n2 = randNNI.node2;
+                Node *a = (*randNNI.node1Nei_it)->node;   // moves from n1 to n2
+                Node *b = (*randNNI.node2Nei_it)->node;   // moves from n2 to n1
+                doNNI(randNNI);
+                erase(n1, a); erase(n2, b);
+                insert(a, n2); insert(b, n1);
+            }
+            cntNNI++;
+        }
+    }
+
     while (cntNNI < numRandomNNI) {
         nniBranches.clear();
         nonNNIBranches.clear();

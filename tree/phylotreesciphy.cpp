@@ -736,6 +736,10 @@ void PhyloTreeSciPhy::initializeAllPartialLh() {
     clearAllPartialLH();
 }
 
+void PhyloTreeSciPhy::prepareToComputeDistances() {
+    if (!hasBarcodeAlignment()) IQTree::prepareToComputeDistances();
+}
+
 int PhyloTreeSciPhy::wrapperFixNegativeBranch(bool force_change) {
     if (!hasBarcodeAlignment() || force_change) {
         return IQTree::wrapperFixNegativeBranch(force_change);
@@ -1618,6 +1622,7 @@ void PhyloTreeSciPhy::runClockDating(const std::string &prefix) {
         outWarning("--clock-date needs a rooted SciPhy (barcode) tree; skipped");
         return;
     }
+    const double t_start = getRealTime();
     const ModelSciPhy *sm = dynamic_cast<const ModelSciPhy*>(model);
     clock_T = sm ? sm->getOriginTime() : 25.0;
     if (rooted) computeBranchDirection();
@@ -1647,11 +1652,13 @@ void PhyloTreeSciPhy::runClockDating(const std::string &prefix) {
     printTree(tfile.c_str(), WT_BR_LEN | WT_BR_LEN_FIXED_WIDTH | WT_SORT_TAXA | WT_NEWLINE);
     ofstream out((prefix + ".clockdate.txt").c_str());
     out << std::setprecision(10) << "clock_rate\t" << clockRate() << "\nroot_age\t" << root_age
-        << "\norigin_time\t" << clock_T << "\nlogL_clock\t" << ll_clock << "\nlogL_free\t" << ll_free << "\n";
+        << "\norigin_time\t" << clock_T << "\nlogL_clock\t" << ll_clock << "\nlogL_free\t" << ll_free
+        << "\ndating_sec\t" << getRealTime() - t_start << "\n";
     out.close();
     cout << "Clock rate: " << clockRate() << "  root age: " << root_age << "  logL (clock): " << ll_clock
          << "  logL (free branch lengths): " << ll_free << endl;
     cout << "Time tree (branch lengths in time units) written to " << tfile << endl;
+    cout << "Clock dating wall-clock time: " << getRealTime() - t_start << " sec" << endl;
 
     restoreBranchLengths(free_len);
     clockSetRate(free_rate);

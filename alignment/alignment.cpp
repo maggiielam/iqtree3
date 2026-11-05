@@ -185,7 +185,9 @@ void Alignment::checkSeqName() {
     }
     if (!ok) outError("Please rename sequences listed above!");
 
-    if (!Params::getInstance().compute_seq_composition) {
+    // barcode data: one state per distinct tape, so a per-state composition test is
+    // meaningless and costs O(nseq * nstates) memory and O(nstates^2) time
+    if (!Params::getInstance().compute_seq_composition || isBarcodeAlignment()) {
         return;
     }
     

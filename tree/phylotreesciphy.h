@@ -81,6 +81,10 @@ public:
     // allocating the parsimony buffers (O(N*S) memory).
     virtual int wrapperFixNegativeBranch(bool force_change) override;
 
+    // ML pairwise distances are never computed for barcode data (compute_ml_dist is off), so
+    // skip the per-thread distance buffers (4 x num_states^2 doubles each; num_states = #tapes)
+    virtual void prepareToComputeDistances() override;
+
     // Strict-clock dating of the current topology (--clock-date): node ages and clock rate by ML,
     // tips at age 0, founder at age --origin-time. Writes <prefix>.timetree.nwk and
     // <prefix>.clockdate.txt; the tree's free branch lengths and clock rate are restored afterwards.
