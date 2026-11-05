@@ -1683,12 +1683,18 @@ double PhyloTreeSciPhy::clockAgeObjective(double a) {
     clock_age[v->id] = a;
     clockApplyAge(v);
     if (clock_age_exact) return computeLikelihood();
-    std::vector<SciPhyAncestorPartials> down;
-    buildDownwardLocal(v, p, down);
+    const double len = std::max(clock_age[p->id] - a, params->min_branch_length);
     PhyloNeighbor *up_nei = (PhyloNeighbor*) v->findNeighbor(p);   // UpToC(p), excluding v's subtree
-    if (down.empty() || !up_nei->sciphy_partial) return computeLikelihood();
-    return combineVectors(*up_nei->sciphy_partial, down,
-                          std::max(clock_age[p->id] - a, params->min_branch_length));
+    if (useOldKernel()) {
+        std::vector<SciPhyAncestorPartials> down;
+        buildDownwardLocal(v, p, down);
+        if (down.empty() || !up_nei->sciphy_partial) return computeLikelihood();
+        return combineVectors(*up_nei->sciphy_partial, down, len);
+    }
+    SciPhyTapePartials &down = tape_nni_down;   // scratch, as in NNI scoring
+    buildTapeDownwardLocal(v, p, down);
+    if (down.head.empty() || !up_nei->sciphy_tape_partial) return computeLikelihood();
+    return combineTape(*up_nei->sciphy_tape_partial, down, len);
 }
 
 double PhyloTreeSciPhy::clockSweep(bool exact) {
@@ -1721,10 +1727,16 @@ double PhyloTreeSciPhy::clockSweep(bool exact) {
         clock_age[v->id] = opt;
         clockApplyAge(v);
         if (!exact) {   // refresh Down(v) so v's parent sees its new subtree
-            std::vector<SciPhyAncestorPartials> down;
-            buildDownwardLocal(v, p, down);
             PhyloNeighbor *pv = (PhyloNeighbor*) p->findNeighbor(v);
-            if (!down.empty() && pv->sciphy_partial) *pv->sciphy_partial = down;
+            if (useOldKernel()) {
+                std::vector<SciPhyAncestorPartials> down;
+                buildDownwardLocal(v, p, down);
+                if (!down.empty() && pv->sciphy_partial) *pv->sciphy_partial = down;
+            } else {
+                SciPhyTapePartials down;
+                buildTapeDownwardLocal(v, p, down);
+                if (!down.head.empty() && pv->sciphy_tape_partial) *pv->sciphy_tape_partial = down;
+            }
         }
     }
     return computeLikelihood();
@@ -1867,12 +1879,18 @@ double PhyloTreeSciPhy::optimFunc(int nvar, double *vars) {
 double PhyloTreeSciPhy::clockEdgeDeriv(PhyloNode *p, PhyloNode *c) {
     PhyloNeighbor *down = (PhyloNeighbor*) p->findNeighbor(c);
     PhyloNeighbor *up = (PhyloNeighbor*) c->findNeighbor(p);
-    if (!down->sciphy_partial || !up->sciphy_partial) return 0.0;
+    const bool old = useOldKernel();
+    if (old ? (!down->sciphy_partial || !up->sciphy_partial)
+            : (!down->sciphy_tape_partial || !up->sciphy_tape_partial)) return 0.0;
     const double len = down->length;
     const double h = std::max(1e-7, 1e-4 * len);
     const double lo = std::max(len - h, 0.0);
-    const double fp = combineVectors(*up->sciphy_partial, *down->sciphy_partial, len + h);
-    const double fm = combineVectors(*up->sciphy_partial, *down->sciphy_partial, lo);
+    auto f = [&](double l) {
+        return old ? combineVectors(*up->sciphy_partial, *down->sciphy_partial, l)
+                   : combineTape(*up->sciphy_tape_partial, *down->sciphy_tape_partial, l);
+    };
+    const double fp = f(len + h);
+    const double fm = f(lo);
     return (fp - fm) / (len + h - lo);
 }
 
