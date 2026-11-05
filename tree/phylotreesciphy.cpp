@@ -1133,6 +1133,7 @@ void PhyloTreeSciPhy::buildDownwardLocal(PhyloNode *child, PhyloNode *parent,
 }
 
 void PhyloTreeSciPhy::buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
+                                      const std::vector<SciPhyAncestorPartials> &child_down,
                                       std::vector<SciPhyAncestorPartials> &out) const {
     const size_t nptn = aln->getNPattern();
     out.assign(nptn, SciPhyAncestorPartials());
@@ -1160,9 +1161,12 @@ void PhyloTreeSciPhy::buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
         kids.push_back(k);
         if (k->node == child) child_nei = k;
     }
-    if (kids.empty() || !child_nei) { out.clear(); return; }
+    if (kids.empty() || !child_nei || child_down.size() != nptn) { out.clear(); return; }
     for (PhyloNeighbor *k : kids)
         if (!k->sciphy_partial) { out.clear(); return; }
+    auto kidPartial = [&](PhyloNeighbor *k, size_t p) -> const SciPhyAncestorPartials & {
+        return (k == child_nei) ? child_down[p] : (*k->sciphy_partial)[p];
+    };
 
     for (size_t p = 0; p < nptn; ++p) {
         SciPhyAncestorPartials &result = out[p];
@@ -1172,7 +1176,7 @@ void PhyloTreeSciPhy::buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
         // observed kids define the support; all-missing -> constant (anchored)
         std::vector<PhyloNeighbor*> obs_support;
         for (size_t k = 0; k < kids.size(); ++k)
-            if (!(*kids[k]->sciphy_partial)[p].wildcard) obs_support.push_back(kids[k]);
+            if (!kidPartial(kids[k], p).wildcard) obs_support.push_back(kids[k]);
 
         const UpView uv = resolveUp(uP0);
         if (obs_support.empty() || uv.u->wildcard) {
@@ -1195,10 +1199,10 @@ void PhyloTreeSciPhy::buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
         const SciPhyAncestorPartials &uP = *uv.u;
         const double len_up = len_Pp + uv.extra_len;
 
-        result.ancestors = (*obs_support[0]->sciphy_partial)[p].ancestors;
+        result.ancestors = kidPartial(obs_support[0], p).ancestors;
         for (size_t k = 1; k < obs_support.size(); ++k) {
             result.ancestors = intersectAncestorLists(
-                result.ancestors, (*obs_support[k]->sciphy_partial)[p].ancestors);
+                result.ancestors, kidPartial(obs_support[k], p).ancestors);
             if (result.ancestors.empty()) break;
         }
         result.partial_lh.assign(result.ancestors.size(), 0.0);
@@ -1360,7 +1364,7 @@ NNIMove PhyloTreeSciPhy::getBestNNIForBran(PhyloNode *node1, PhyloNode *node2,
         rawSwap(cnt);
         std::vector<SciPhyAncestorPartials> downChild, upParent;
         buildDownwardLocal(node2, node1, downChild);
-        buildUpToCLocal(node1, node2, upParent);
+        buildUpToCLocal(node1, node2, downChild, upParent);
 
         double score;
         double optlen = orig_central_len;

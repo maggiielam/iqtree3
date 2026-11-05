@@ -152,7 +152,10 @@ protected:
     // neighbors from cached partials, without touching the cache.
     void buildDownwardLocal(PhyloNode *child, PhyloNode *parent,
                             std::vector<SciPhyAncestorPartials> &out) const;
+    // child_down: Down(child) of the swapped tree (from buildDownwardLocal); the
+    // cached one on (parent -> child) still describes the subtree before the swap
     void buildUpToCLocal(PhyloNode *parent, PhyloNode *child,
+                         const std::vector<SciPhyAncestorPartials> &child_down,
                          std::vector<SciPhyAncestorPartials> &out) const;
 
     int getObservedLeafState(Node *leaf, size_t ptn) const;
