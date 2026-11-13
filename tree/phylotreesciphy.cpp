@@ -17,6 +17,9 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace {
 
@@ -41,6 +44,9 @@ void PhyloTreeSciPhy::readEnv() {
     sciphy_kernel = kernelFromEnv();
     print_ll = std::getenv("IQTREE_SCIPHY_PRINTLL") != nullptr;
     nni_cache_check = std::getenv("IQTREE_SCIPHY_CHECK") != nullptr;
+    const char *bl = std::getenv("IQTREE_SCIPHY_BRLEN");
+    brlen_brent = bl && !strcmp(bl, "brent");
+    brlen_check = std::getenv("IQTREE_SCIPHY_CHECK_BRLEN") != nullptr;
 }
 
 PhyloTreeSciPhy::~PhyloTreeSciPhy() {
@@ -51,7 +57,7 @@ void PhyloTreeSciPhy::reportKernelCheck() {
     for (auto &it : check_stats)
         std::cout << std::scientific << std::setprecision(2) << "[sciphy kernel check] " << it.first
                   << ": " << it.second.n << " tape comparisons, max relative |dlogL| = "
-                  << it.second.max_rel << ", " << it.second.fail << " above 1e-10" << std::endl;
+                  << it.second.max_rel << ", " << it.second.fail << " above threshold" << std::endl;
     check_stats.clear();
 }
 
@@ -1070,6 +1076,23 @@ void PhyloTreeSciPhy::optimizeOneBranchCombine(PhyloNode *node1, PhyloNode *node
     const double current_len = current_it->length;
     double negative_lh = 0.0, ferror = 0.0;
 
+    if (closedFormBrlen()) {
+        buildBranchCoeffs(*up_nei->sciphy_tape_partial, *down_nei->sciphy_tape_partial, brlen_bc);
+        double nl;
+        bool used;
+        const double fl = optimizeBranchClosedForm(brlen_bc, current_len, nl, used);
+        if (brlen_check) recordCheck("brlen-sweep fallback to Brent", used ? 0.0 : 1.0, 0.5);
+        if (used) {
+            if (brlen_check) {
+                const SciPhyTapePartials &U = *up_nei->sciphy_tape_partial, &D = *down_nei->sciphy_tape_partial;
+                checkBranchClosedForm("brlen-sweep", brlen_bc, current_len, nl, fl,
+                                      [&](double l) { return combineTape(U, D, l); });
+            }
+            current_it->length = current_it_back->length = nl;
+            return;
+        }
+    }
+
     sciphy_combine_active = true;
     const double initial_neg_lh = -combineAtBranch(sciphy_combine_parent, sciphy_combine_child);
     double optx = minimizeOneDimen(params->min_branch_length, current_len,
@@ -1091,6 +1114,24 @@ void PhyloTreeSciPhy::optimizeOriginBranch() {
 
     double cur = origin_edge->length;
     if (cur < params->min_branch_length) cur = params->min_branch_length;
+
+    if (closedFormBrlen()) {
+        buildOriginCoeffs(*origin_edge->sciphy_tape_partial, brlen_bc);
+        double nl;
+        bool used;
+        const double fl = optimizeBranchClosedForm(brlen_bc, cur, nl, used);
+        if (brlen_check) recordCheck("brlen-origin fallback to Brent", used ? 0.0 : 1.0, 0.5);
+        if (used) {
+            if (brlen_check) {
+                const SciPhyTapePartials &bio = *origin_edge->sciphy_tape_partial;
+                checkBranchClosedForm("brlen-origin", brlen_bc, cur, nl, fl,
+                                      [&](double l) { return originClosureTape(bio, l, nullptr); });
+            }
+            origin_edge->length = nl;
+            if (ob) ob->length = nl;
+            return;
+        }
+    }
 
     sciphy_origin_active = true;
     double neg = 0.0, ferr = 0.0;
@@ -1129,8 +1170,39 @@ double PhyloTreeSciPhy::optimizeAllBranches(int my_iterations, double tolerance,
         computeSciPhyFullUpward();
         optimizeOriginBranch();
 
-        for (size_t j = 0; j < nodes.size(); ++j) {
-            optimizeOneBranchCombine((PhyloNode*) nodes[j], (PhyloNode*) nodes2[j]);
+        if (parallelPathEnabled()) {
+            // branches use the same snapshot, so they are independent; apply lengths afterwards
+            const int nb = (int)nodes.size(), nt = numWorkThreads();
+            std::vector<double> new_len(nb, 0.0);
+            std::vector<char> status(nb, 0);
+            workspace(nt - 1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 16) num_threads(nt) if (nt > 1)
+#endif
+            for (int j = 0; j < nb; ++j) {
+                Workspace &ws = threadWorkspace();
+                status[j] = (char) sweepBranchClosedForm((PhyloNode*) nodes[j], (PhyloNode*) nodes2[j],
+                                                         new_len[j], ws);
+            }
+            for (int j = 0; j < nb; ++j) {
+                PhyloNode *n1 = (PhyloNode*) nodes[j], *n2 = (PhyloNode*) nodes2[j];
+                if (status[j] == 1) {
+                    PhyloNeighbor *a = (PhyloNeighbor*) n1->findNeighbor(n2);
+                    PhyloNeighbor *b = (PhyloNeighbor*) n2->findNeighbor(n1);
+                    a->length = b->length = new_len[j];
+                } else if (status[j] == 2) {
+                    optimizeOneBranchCombine(n1, n2);   // Brent fallback
+                }
+                // current_it = last non-origin branch, as in the sequential loop
+                if (!(rooted && (n1 == root || n2 == root))) {
+                    current_it      = (PhyloNeighbor*) n1->findNeighbor(n2);
+                    current_it_back = (PhyloNeighbor*) n2->findNeighbor(n1);
+                }
+            }
+        } else {
+            for (size_t j = 0; j < nodes.size(); ++j) {
+                optimizeOneBranchCombine((PhyloNode*) nodes[j], (PhyloNode*) nodes2[j]);
+            }
         }
 
         tree_lh = computeLikelihood(nullptr, true);
@@ -1445,7 +1517,23 @@ double PhyloTreeSciPhy::scoreNNICandidate(PhyloNode *node1, PhyloNode *node2, in
 
     double score;
     optlen = orig_len;
-    if (cached) {
+    bool done_closed = false;
+    if (cached && closedFormBrlen()) {
+        buildBranchCoeffs(tape_nni_up, tape_nni_down, brlen_bc);
+        bool used;
+        double nl;
+        const double fl = optimizeBranchClosedForm(brlen_bc, orig_len, nl, used);
+        if (brlen_check) recordCheck("brlen-nni fallback to Brent", used ? 0.0 : 1.0, 0.5);
+        if (used) {
+            if (brlen_check)
+                checkBranchClosedForm("brlen-nni", brlen_bc, orig_len, nl, fl,
+                                      [&](double l) { return combineTape(tape_nni_up, tape_nni_down, l); });
+            optlen = nl;
+            score = fl;
+            done_closed = true;
+        }
+    }
+    if (!done_closed && cached) {   // Brent on the local partials
         if (useOldKernel()) {
             sciphy_nni_up = &upParent;
             sciphy_nni_down = &downChild;
@@ -1478,7 +1566,7 @@ double PhyloTreeSciPhy::scoreNNICandidate(PhyloNode *node1, PhyloNode *node2, in
                 checkTapes("nni", new_ptn.data(), old_ptn.data());
             }
         }
-    } else {
+    } else if (!done_closed) {      // no local partials: exact logL at the original length
         central->length = central_back->length = orig_len;
         score = computeLikelihood();
     }
@@ -1883,6 +1971,13 @@ double PhyloTreeSciPhy::clockEdgeDeriv(PhyloNode *p, PhyloNode *c) {
     if (old ? (!down->sciphy_partial || !up->sciphy_partial)
             : (!down->sciphy_tape_partial || !up->sciphy_tape_partial)) return 0.0;
     const double len = down->length;
+    if (!old && !brlen_brent) {   // analytic derivative from the closed form
+        buildBranchCoeffs(*up->sciphy_tape_partial, *down->sciphy_tape_partial, brlen_bc);
+        bool ok;
+        double d1;
+        branchLogL(brlen_bc, len, &d1, nullptr, ok);
+        if (ok) return d1;
+    }
     const double h = std::max(1e-7, 1e-4 * len);
     const double lo = std::max(len - h, 0.0);
     auto f = [&](double l) {
@@ -2258,13 +2353,14 @@ SciPhyTapePartials &PhyloTreeSciPhy::tapePartials(PhyloNeighbor *nei) const {
 // lh[i] *= sum_j T(i,j) child[j] over one child branch; a product that underflows
 // flags tape p for a log-space redo.
 void PhyloTreeSciPhy::multiplyChild(const BranchTable &bt, int p, const SciPhyTapeHead &c,
-                                    const double *child_lh, SciPhyTapeHead &h, double *lh) {
+                                    const double *child_lh, SciPhyTapeHead &h, double *lh,
+                                    std::vector<char> &redo) const {
     double v[MAX_TAPE_SITES + 1];
     h.log_scale += transDown(bt, tape_len[p], prefixProd(c.rep), prefixZeros(c.rep),
                              child_lh, c.depth, h.depth, v);
     double mx = 0.0;
     for (int i = 0; i <= h.depth; ++i) { lh[i] *= v[i]; mx = std::max(mx, lh[i]); }
-    if (mx < LH_UNDERFLOW) tape_redo[p] = 1;
+    if (mx < LH_UNDERFLOW) redo[p] = 1;
     else if (mx < RENORM_BELOW) h.log_scale += normalizeTape(lh, h.depth);
 }
 
@@ -2283,8 +2379,47 @@ void PhyloTreeSciPhy::commonSupport(const std::vector<PhyloNeighbor*> &kids, Hea
     }
 }
 
-// Post-order: cache Down(subtree) on dad_branch->sciphy_tape_partial.
+// Down partials below dad_branch, by height level; nodes in a level run in parallel.
 void PhyloTreeSciPhy::computeTapeDownward(PhyloNeighbor *dad_branch, PhyloNode *dad) {
+    struct Item { PhyloNeighbor *edge; PhyloNode *dad; int height; };
+    std::vector<Item> order;                       // pre-order
+    std::vector<std::pair<PhyloNeighbor*, PhyloNode*>> stack{{dad_branch, dad}};
+    std::vector<int> parent_of;                    // index of the parent item
+    std::vector<int> pstack{-1};
+    while (!stack.empty()) {
+        auto [e, d] = stack.back(); stack.pop_back();
+        const int par = pstack.back(); pstack.pop_back();
+        order.push_back({e, d, 0});
+        parent_of.push_back(par);
+        const int me = (int)order.size() - 1;
+        PhyloNode *node = (PhyloNode*) e->node;
+        if (e->partial_lh_computed & 1) continue;  // cached: nothing to recompute below
+        FOR_NEIGHBOR_IT(node, d, it) { stack.push_back({(PhyloNeighbor*) *it, node}); pstack.push_back(me); }
+    }
+    for (int i = (int)order.size() - 1; i >= 0; --i)      // children before parents
+        if (parent_of[i] >= 0)
+            order[parent_of[i]].height = std::max(order[parent_of[i]].height, order[i].height + 1);
+    int max_h = 0;
+    for (const Item &it : order) max_h = std::max(max_h, it.height);
+    std::vector<std::vector<int>> levels(max_h + 1);
+    for (int i = 0; i < (int)order.size(); ++i) levels[order[i].height].push_back(i);
+    const int nt = numWorkThreads();
+    workspace(nt - 1);
+    for (const std::vector<int> &lev : levels) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 8) num_threads(nt) if (nt > 1 && lev.size() > 16)
+#endif
+        for (int j = 0; j < (int)lev.size(); ++j) {
+            const Item &it = order[lev[j]];
+            if (it.edge->partial_lh_computed & 1) continue;
+            Workspace &ws = threadWorkspace();
+            computeTapeDownNode(it.edge, it.dad, ws);
+        }
+    }
+}
+
+void PhyloTreeSciPhy::computeTapeDownNode(PhyloNeighbor *dad_branch, PhyloNode *dad,
+                                          Workspace &ws) const {
     if (dad_branch->partial_lh_computed & 1) {
         return;
     }
@@ -2318,16 +2453,13 @@ void PhyloTreeSciPhy::computeTapeDownward(PhyloNeighbor *dad_branch, PhyloNode *
     }
 
     std::vector<PhyloNeighbor*> kids;
-    FOR_NEIGHBOR_IT(node, dad, it) {
-        computeTapeDownward((PhyloNeighbor*) *it, node);
-        kids.push_back((PhyloNeighbor*) *it);
-    }
-    if (!kids.empty()) combineTapeChildren(kids, out);
+    FOR_NEIGHBOR_IT(node, dad, it) kids.push_back((PhyloNeighbor*) *it);   // lower levels
+    if (!kids.empty()) combineTapeChildren(kids, out, ws);
     dad_branch->partial_lh_computed |= 1;
 }
 
 void PhyloTreeSciPhy::combineTapeChildren(const std::vector<PhyloNeighbor*> &kids,
-                                          SciPhyTapePartials &out) {
+                                          SciPhyTapePartials &out, Workspace &ws) const {
     const int nptn = (int)aln->getNPattern();
 
     // support: prefixes of the observed children's common prefix; wildcard children
@@ -2350,21 +2482,21 @@ void PhyloTreeSciPhy::combineTapeChildren(const std::vector<PhyloNeighbor*> &kid
     }
 
     // one Poisson table per child branch, shared by all tapes
-    tape_redo.assign(nptn, 0);
+    std::vector<char> &redo = ws.redo;
+    redo.assign(nptn, 0);
     for (PhyloNeighbor *k : kids) {
         BranchTable bt;
         fillBranchTable(k->length, bt);
         const SciPhyTapePartials &cp = *k->sciphy_tape_partial;
-#pragma omp parallel for schedule(static) num_threads(num_threads) if (num_threads > 1)
         for (int p = 0; p < nptn; ++p) {
             SciPhyTapeHead &h = out.head[p];
             const SciPhyTapeHead &c = cp.head[p];
-            if (h.wildcard || c.wildcard || tape_redo[p]) continue;
-            multiplyChild(bt, p, c, &cp.lh[tape_lh_offset[p]], h, &out.lh[tape_lh_offset[p]]);
+            if (h.wildcard || c.wildcard || redo[p]) continue;
+            multiplyChild(bt, p, c, &cp.lh[tape_lh_offset[p]], h, &out.lh[tape_lh_offset[p]], redo);
         }
     }
 
-    finishTapes(out, tape_lh_offset, tape_redo, [&](int p, SciPhyTapeHead &h, double *lh) {
+    finishTapes(out, tape_lh_offset, redo, [&](int p, SciPhyTapeHead &h, double *lh) {
         h.log_scale = 0.0;
         for (PhyloNeighbor *k : kids) h.log_scale += k->sciphy_tape_partial->head[p].log_scale;
         h.log_scale += tapeLogs(p, h.rep, h.depth, nullptr, 0, 0.0, kids, nullptr, lh);
@@ -2418,12 +2550,29 @@ void PhyloTreeSciPhy::computeTapeFullUpward() {
         h.log_scale = 0.0;
         seed.lh[tape_lh_offset[p]] = 1.0;
     }
-    computeTapeUpward(root_int, root_node);
+    // by depth level from the founder; nodes in a level run in parallel
+    const int nt = numWorkThreads();
+    workspace(nt - 1);
+    std::vector<std::pair<PhyloNode*, PhyloNode*>> level{{root_int, root_node}}, next;
+    while (!level.empty()) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 8) num_threads(nt) if (nt > 1 && level.size() > 16)
+#endif
+        for (int j = 0; j < (int)level.size(); ++j) {
+            Workspace &ws = threadWorkspace();
+            computeTapeUpwardNode(level[j].first, level[j].second, ws);
+        }
+        next.clear();
+        for (auto &nd : level)
+            FOR_NEIGHBOR_IT(nd.first, nd.second, it)
+                if (!(*it)->node->isLeaf()) next.push_back({(PhyloNode*) (*it)->node, nd.first});
+        level.swap(next);
+    }
     sciphy_snapshot_valid = true;
 }
 
-// Pre-order: cache UpToC(node) on each (child -> node) half-edge below `node`.
-void PhyloTreeSciPhy::computeTapeUpward(PhyloNode *node, PhyloNode *dad) {
+// UpToC(node) on each (child -> node) half-edge of `node`.
+void PhyloTreeSciPhy::computeTapeUpwardNode(PhyloNode *node, PhyloNode *dad, Workspace &ws) const {
     const int nptn = (int)aln->getNPattern();
 
     //   up_nei   = (node -> dad): holds UpToC(dad)   [function of dad's state]
@@ -2435,8 +2584,9 @@ void PhyloTreeSciPhy::computeTapeUpward(PhyloNode *node, PhyloNode *dad) {
     const SciPhyTapePartials &downNode = *down_nei->sciphy_tape_partial;
 
     // UpBar(node)[s] = sum_{s_dad} UpToC(dad)[s_dad] * T(s_dad -> s), s in Down(node)'s support
-    SciPhyTapePartials &ub = tape_upbar;
+    SciPhyTapePartials &ub = ws.upbar;
     sizeTapePartials(ub);
+    std::vector<char> &redo = ws.redo;
     {
         BranchTable bt;
         fillBranchTable(down_nei->length, bt);
@@ -2473,13 +2623,13 @@ void PhyloTreeSciPhy::computeTapeUpward(PhyloNode *node, PhyloNode *dad) {
     }
 
     // UpToC(node) for child c = UpBar(node) * prod_{siblings d} sum_{s_d} T * Down(d),
-    // stored on (c -> node). All children first: the recursion reuses the UpBar scratch.
+    // stored on (c -> node).
     for (size_t ci = 0; ci < childDown.size(); ++ci) {
         PhyloNeighbor *c_up = (PhyloNeighbor*) childNode[ci]->findNeighbor(node);
         SciPhyTapePartials &out = tapePartials(c_up);
         std::copy(ub.head.begin(), ub.head.end(), out.head.begin());
         std::copy(ub.lh.begin(), ub.lh.end(), out.lh.begin());
-        tape_redo.assign(nptn, 0);
+        redo.assign(nptn, 0);
         for (size_t di = 0; di < childDown.size(); ++di) {
             if (di == ci) continue;
             const SciPhyTapePartials &dd = *childDown[di]->sciphy_tape_partial;
@@ -2489,12 +2639,12 @@ void PhyloTreeSciPhy::computeTapeUpward(PhyloNode *node, PhyloNode *dad) {
                 SciPhyTapeHead &h = out.head[p];
                 const SciPhyTapeHead &d = dd.head[p];
                 h.log_scale += d.log_scale;   // constant UpBar folds in all sibling constants
-                if (h.wildcard || d.wildcard || tape_redo[p]) continue;
+                if (h.wildcard || d.wildcard || redo[p]) continue;
                 const size_t off = tape_lh_offset[p];
-                multiplyChild(bt, p, d, &dd.lh[off], h, &out.lh[off]);
+                multiplyChild(bt, p, d, &dd.lh[off], h, &out.lh[off], redo);
             }
         }
-        finishTapes(out, tape_lh_offset, tape_redo, [&](int p, SciPhyTapeHead &h, double *lh) {
+        finishTapes(out, tape_lh_offset, redo, [&](int p, SciPhyTapeHead &h, double *lh) {
             h.log_scale = upToDad.head[p].log_scale;
             for (size_t di = 0; di < childDown.size(); ++di)
                 if (di != ci) h.log_scale += childDown[di]->sciphy_tape_partial->head[p].log_scale;
@@ -2503,8 +2653,6 @@ void PhyloTreeSciPhy::computeTapeUpward(PhyloNode *node, PhyloNode *dad) {
         });
         c_up->partial_lh_computed |= 1;
     }
-    for (size_t ci = 0; ci < childNode.size(); ++ci)
-        computeTapeUpward(childNode[ci], node);
 }
 
 // Whole-tree logL from an up partial (parent state) and a down partial (child state)
@@ -2566,8 +2714,7 @@ double PhyloTreeSciPhy::originClosureTape(const SciPhyTapePartials &bio, double 
     BranchTable bt;
     fillBranchTable(t, bt);
     double tree_lh = 0.0;
-#pragma omp parallel for schedule(static) num_threads(num_threads) if (num_threads > 1) reduction(+: tree_lh)
-    for (int p = 0; p < nptn; ++p) {
+    for (int p = 0; p < nptn; ++p) {   // sequential: fixed summation order
         const SciPhyTapeHead &b = bio.head[p];
         double lp;
         if (b.wildcard) {
@@ -2595,27 +2742,28 @@ void PhyloTreeSciPhy::buildTapeDownwardLocal(PhyloNode *child, PhyloNode *parent
                                              SciPhyTapePartials &out) {
     std::vector<PhyloNeighbor*> kids;
     FOR_NEIGHBOR_IT(child, parent, it) kids.push_back((PhyloNeighbor*) *it);
+    buildTapeDownwardKids(kids, out, workspace(0));
+}
+
+void PhyloTreeSciPhy::buildTapeDownwardKids(const std::vector<PhyloNeighbor*> &kids,
+                                            SciPhyTapePartials &out, Workspace &ws) const {
     out.head.clear();
     if (kids.empty()) return;
     for (PhyloNeighbor *k : kids)
         if (!k->sciphy_tape_partial) return;   // cache miss
     sizeTapePartials(out);
-    combineTapeChildren(kids, out);
+    combineTapeChildren(kids, out, ws);
 }
 
 void PhyloTreeSciPhy::buildTapeUpToCLocal(PhyloNode *parent, PhyloNode *child,
                                           const SciPhyTapePartials &child_down,
                                           SciPhyTapePartials &out) {
-    const int nptn = (int)aln->getNPattern();
     out.head.clear();
-
     // parent's toward-root half-edge holds UpToC(grandparent or founder)
     PhyloNeighbor *pnei = nullptr;
     FOR_NEIGHBOR_IT(parent, nullptr, it)
         if (((PhyloNeighbor*) *it)->direction == TOWARD_ROOT) { pnei = (PhyloNeighbor*) *it; break; }
-    if (!pnei || !pnei->sciphy_tape_partial) return;
-    const SciPhyTapePartials &upP = *pnei->sciphy_tape_partial;
-
+    if (!pnei) return;
     // parent's children: `child` plus its siblings
     std::vector<PhyloNeighbor*> kids;
     PhyloNeighbor *child_nei = nullptr;
@@ -2625,6 +2773,16 @@ void PhyloTreeSciPhy::buildTapeUpToCLocal(PhyloNode *parent, PhyloNode *child,
         kids.push_back(k);
         if (k->node == child) child_nei = k;
     }
+    buildTapeUpToCKids(pnei, kids, child_nei, child_down, out, workspace(0));
+}
+
+void PhyloTreeSciPhy::buildTapeUpToCKids(PhyloNeighbor *pnei, const std::vector<PhyloNeighbor*> &kids,
+                                         PhyloNeighbor *child_nei, const SciPhyTapePartials &child_down,
+                                         SciPhyTapePartials &out, Workspace &ws) const {
+    const int nptn = (int)aln->getNPattern();
+    out.head.clear();
+    if (!pnei || !pnei->sciphy_tape_partial) return;
+    const SciPhyTapePartials &upP = *pnei->sciphy_tape_partial;
     if (kids.empty() || !child_nei || (int)child_down.head.size() != nptn) return;
     for (PhyloNeighbor *k : kids)
         if (!k->sciphy_tape_partial) return;
@@ -2656,7 +2814,8 @@ void PhyloTreeSciPhy::buildTapeUpToCLocal(PhyloNode *parent, PhyloNode *child,
     }
 
     // UpBar(parent), then times each sibling's down contribution
-    tape_redo.assign(nptn, 0);
+    std::vector<char> &redo = ws.redo;
+    redo.assign(nptn, 0);
     {
         BranchTable bt;
         fillBranchTable(pnei->length, bt);
@@ -2668,7 +2827,7 @@ void PhyloTreeSciPhy::buildTapeUpToCLocal(PhyloNode *parent, PhyloNode *child,
             h.log_scale += transUp(bt, tape_len[p], prefixProd(h.rep), prefixZeros(h.rep),
                                    &upP.lh[off], std::min((int)uP.depth, (int)h.depth), h.depth, &out.lh[off]);
             const double lmax = normalizeTape(&out.lh[off], h.depth);
-            if (lmax < std::log(LH_UNDERFLOW)) tape_redo[p] = 1;
+            if (lmax < std::log(LH_UNDERFLOW)) redo[p] = 1;
             else h.log_scale += lmax;
         }
     }
@@ -2682,12 +2841,12 @@ void PhyloTreeSciPhy::buildTapeUpToCLocal(PhyloNode *parent, PhyloNode *child,
             const SciPhyTapeHead &d = dd.head[p];
             if (h.wildcard) continue;
             h.log_scale += d.log_scale;
-            if (d.wildcard || tape_redo[p]) continue;
+            if (d.wildcard || redo[p]) continue;
             const size_t off = tape_lh_offset[p];
-            multiplyChild(bt, p, d, &dd.lh[off], h, &out.lh[off]);
+            multiplyChild(bt, p, d, &dd.lh[off], h, &out.lh[off], redo);
         }
     }
-    finishTapes(out, tape_lh_offset, tape_redo, [&](int p, SciPhyTapeHead &h, double *lh) {
+    finishTapes(out, tape_lh_offset, redo, [&](int p, SciPhyTapeHead &h, double *lh) {
         h.log_scale = upP.head[p].log_scale;
         for (PhyloNeighbor *k : kids)
             if (k != child_nei) h.log_scale += k->sciphy_tape_partial->head[p].log_scale;
@@ -2739,5 +2898,390 @@ void PhyloTreeSciPhy::checkAllBranches() {
         combineVectors(*up_nei->sciphy_partial, *down_nei->sciphy_partial,
                        down_nei->length, old_ptn.data());
         checkTapes("upward", new_ptn.data(), old_ptn.data());
+    }
+}
+
+// <----- Closed-form branch likelihood and Newton branch lengths ----->
+// Per tape: S(mu) = sum_k c_k Pois(k; mu) + sum_r e_r P(K >= r; mu), k = number of new edits.
+
+void PhyloTreeSciPhy::buildBranchCoeffs(const SciPhyTapePartials &U, const SciPhyTapePartials &D,
+                                        BranchCoeffs &bc) const {
+    const size_t nptn = aln->getNPattern();
+    bc.c.assign(tape_lh_offset.back(), 0.0);
+    bc.e.assign(tape_lh_offset.back(), 0.0);
+    bc.scale.assign(nptn, 0.0);
+    bc.active.assign(nptn, 0);
+    bc.const_logl = 0.0;
+    for (size_t p = 0; p < nptn; ++p) {
+        const SciPhyTapeHead &uc = U.head[p];
+        const SciPhyTapeHead &dc = D.head[p];
+        const size_t off = tape_lh_offset[p];
+        if (uc.wildcard || dc.wildcard) {   // constant in the branch length (as in combineTape)
+            double lp;
+            if (uc.wildcard && dc.wildcard) lp = uc.log_scale + dc.log_scale;
+            else if (dc.wildcard)           lp = totalTapeMass(uc, &U.lh[off]) + dc.log_scale;
+            else                            lp = totalTapeMass(dc, &D.lh[off]) + uc.log_scale;
+            bc.const_logl += lp * ptn_freq[p];
+            continue;
+        }
+        const int L = tape_len[p];
+        const int dp = std::min(uc.depth, dc.depth);
+        const double *F = prefixProd(dc.rep);
+        const unsigned char *Z = prefixZeros(dc.rep);
+        const int jp = (dc.depth == L) ? L - 1 : dc.depth;   // last non-full child state
+        for (int i = 0; i <= dp; ++i) {
+            const double Ui = U.lh[off + i];
+            if (!(Ui > 0.0)) continue;
+            int j = i;
+            for (; j <= jp && Z[j] == Z[i]; ++j)
+                bc.c[off + (j - i)] += Ui * D.lh[off + j] * (F[j] / F[i]);
+            if (dc.depth == L && j == L && Z[L] == Z[i])
+                bc.e[off + (L - i)] += Ui * D.lh[off + L] * (F[L] / F[i]);
+        }
+        bc.scale[p] = uc.log_scale + dc.log_scale;
+        bc.active[p] = 1;
+    }
+}
+
+void PhyloTreeSciPhy::buildOriginCoeffs(const SciPhyTapePartials &bio, BranchCoeffs &bc) const {
+    const size_t nptn = aln->getNPattern();
+    bc.c.assign(tape_lh_offset.back(), 0.0);
+    bc.e.assign(tape_lh_offset.back(), 0.0);
+    bc.scale.assign(nptn, 0.0);
+    bc.active.assign(nptn, 0);
+    bc.const_logl = 0.0;
+    for (size_t p = 0; p < nptn; ++p) {
+        const SciPhyTapeHead &b = bio.head[p];
+        const size_t off = tape_lh_offset[p];
+        if (b.wildcard) { bc.const_logl += b.log_scale * ptn_freq[p]; continue; }
+        // founder = unedited (depth 0, weight 1), as in originClosureTape
+        const int L = tape_len[p];
+        const double *F = prefixProd(b.rep);
+        const unsigned char *Z = prefixZeros(b.rep);
+        const int jp = (b.depth == L) ? L - 1 : b.depth;
+        int j = 0;
+        for (; j <= jp && Z[j] == Z[0]; ++j) bc.c[off + j] += bio.lh[off + j] * (F[j] / F[0]);
+        if (b.depth == L && j == L && Z[L] == Z[0]) bc.e[off + L] += bio.lh[off + L] * (F[L] / F[0]);
+        bc.scale[p] = b.log_scale;
+        bc.active[p] = 1;
+    }
+}
+
+double PhyloTreeSciPhy::branchLogL(const BranchCoeffs &bc, double len, double *d1, double *d2,
+                                   bool &ok) const {
+    ok = false;
+    BranchTable bt;
+    fillBranchTable(len, bt);
+    if (bt.log_space) return -std::numeric_limits<double>::infinity();
+    const int Lm = max_tape_len;
+    double dpois[MAX_TAPE_SITES + 1], d2pois[MAX_TAPE_SITES + 1];
+    double dtail[MAX_TAPE_SITES + 1], d2tail[MAX_TAPE_SITES + 1];
+    for (int k = 0; k <= Lm; ++k) {
+        const double p1 = (k >= 1) ? bt.pois[k - 1] : 0.0;
+        const double p2 = (k >= 2) ? bt.pois[k - 2] : 0.0;
+        dpois[k]  = p1 - bt.pois[k];
+        d2pois[k] = p2 - 2.0 * p1 + bt.pois[k];
+        dtail[k]  = p1;
+        d2tail[k] = p2 - p1;
+    }
+    double f = bc.const_logl, g = 0.0, h = 0.0;
+    const size_t nptn = bc.active.size();
+    for (size_t p = 0; p < nptn; ++p) {
+        if (!bc.active[p]) continue;
+        const int L = tape_len[p];
+        const size_t off = tape_lh_offset[p];
+        double S = 0.0, S1 = 0.0, S2 = 0.0;
+        for (int k = 0; k < L; ++k) {
+            const double c = bc.c[off + k];
+            if (c == 0.0) continue;
+            S += c * bt.pois[k]; S1 += c * dpois[k]; S2 += c * d2pois[k];
+        }
+        for (int r = 0; r <= L; ++r) {   // r = 0: parent already full, P(K >= 0) = 1
+            const double e = bc.e[off + r];
+            if (e == 0.0) continue;
+            S += e * bt.tail[r]; S1 += e * dtail[r]; S2 += e * d2tail[r];
+        }
+        if (!(S >= LH_UNDERFLOW)) return -std::numeric_limits<double>::infinity();
+        const double w = ptn_freq[p], r1 = S1 / S;
+        f += w * (std::log(S) + bc.scale[p]);
+        g += w * r1;
+        h += w * (S2 / S - r1 * r1);
+    }
+    const double lambda = sciphyModel().getClockRate();   // dmu/dlen
+    if (d1) *d1 = lambda * g;
+    if (d2) *d2 = lambda * lambda * h;
+    ok = true;
+    return f;
+}
+
+// Newton in log(len), step capped at 8x, bracketed by the sign of f'; false = use Brent.
+bool PhyloTreeSciPhy::newtonBranchLength(const BranchCoeffs &bc, double x, double f, double g,
+                                         double h, double &best_len, double &best_logl) const {
+    const double lo = params->min_branch_length, hi = params->max_branch_length;
+    const double tol = std::max(params->min_branch_length, 1e-10);
+    const double LOG_CAP = std::log(8.0);
+    best_len = x; best_logl = f;
+    double a = lo, b = hi;
+    for (int it = 0; it < 100; ++it) {
+        if (g > 0.0) a = x; else if (g < 0.0) b = x; else return true;
+        if ((x <= lo && g <= 0.0) || (x >= hi && g >= 0.0)) return true;   // boundary optimum
+        const double fu = x * g, fuu = x * x * h + x * g;
+        double step = (fuu < 0.0) ? -fu / fuu : (g > 0.0 ? LOG_CAP : -LOG_CAP);
+        step = std::min(LOG_CAP, std::max(-LOG_CAP, step));
+        double xn = x * std::exp(step);
+        if (!(xn > a && xn < b)) xn = std::sqrt(std::max(a, 1e-300) * b);   // geometric bisection
+        xn = std::min(hi, std::max(lo, xn));
+        const double dx = xn - x;
+        x = xn;
+        bool ok;
+        f = branchLogL(bc, x, &g, &h, ok);
+        if (!ok) return false;
+        if (f > best_logl) { best_logl = f; best_len = x; }
+        if (std::fabs(dx) < tol || b - a < tol) return true;
+    }
+    return false;
+}
+
+// Newton from the current length; keeps cur unless the new length is better.
+double PhyloTreeSciPhy::optimizeBranchClosedForm(const BranchCoeffs &bc, double cur, double &new_len,
+                                                 bool &used_newton) const {
+    used_newton = false;
+    new_len = cur;
+    bool ok;
+    const double x0 = std::min(std::max(cur, params->min_branch_length), params->max_branch_length);
+    double g, h;
+    const double f0 = branchLogL(bc, x0, &g, &h, ok);
+    if (!ok) return f0;
+    double x, fx;
+    if (!newtonBranchLength(bc, x0, f0, g, h, x, fx)) return f0;
+    used_newton = true;
+    if (x0 != cur) {   // cur was outside the allowed range
+        const double fc = branchLogL(bc, cur, nullptr, nullptr, ok);
+        if (ok && fx < fc - 1e-8) return fc;
+    } else if (fx < f0 - 1e-8) {
+        return f0;
+    }
+    new_len = x;
+    return fx;
+}
+
+void PhyloTreeSciPhy::recordCheck(const std::string &key, double err, double thresh) {
+    CheckStats &st = check_stats[key];
+    ++st.n;
+    st.max_rel = std::max(st.max_rel, err);
+    if (err > thresh && ++st.fail <= 20)
+        std::cerr << std::setprecision(12) << "[sciphy brlen check] " << key << ": error " << err
+                  << " > " << thresh << std::endl;
+}
+
+namespace {
+// golden-section reference maximizer for the checks
+template <class F>
+double goldenMax(F f, double a, double b, double tol, double &fx) {
+    const double gr = 0.5 * (std::sqrt(5.0) - 1.0);
+    double c = b - gr * (b - a), d = a + gr * (b - a), fc = f(c), fd = f(d);
+    while (b - a > tol) {
+        if (fc > fd) { b = d; d = c; fd = fc; c = b - gr * (b - a); fc = f(c); }
+        else         { a = c; c = d; fc = fd; d = a + gr * (b - a); fd = f(d); }
+    }
+    const double x = 0.5 * (a + b);
+    fx = f(x);
+    return x;
+}
+}  // anonymous namespace
+
+template <class Exact>
+void PhyloTreeSciPhy::checkBranchClosedForm(const char *where, const BranchCoeffs &bc, double cur,
+                                            double newton_len, double newton_logl, Exact exact) {
+    const std::string w(where);
+    bool ok;
+    // 1. closed form == exact likelihood (relative to |logL|)
+    for (double l : {cur, newton_len, 0.5 * cur + 1e-4, 2.0 * cur + 1e-3}) {
+        const double a = branchLogL(bc, l, nullptr, nullptr, ok), b = exact(l);
+        if (ok && std::isfinite(b)) recordCheck(w + " identity", std::fabs(a - b) / std::max(1.0, std::fabs(b)), 1e-10);
+    }
+    // 2. analytic derivative == central difference of the exact likelihood
+    double d1, d2;
+    branchLogL(bc, cur, &d1, &d2, ok);
+    const double hstep = std::max(1e-6, 1e-3 * cur);
+    if (ok && cur - 2.0 * hstep > 0.0) {
+        // 5-point stencil; the reference itself has rounding noise ~ eps |logL| / h
+        const double f0 = exact(cur);
+        const double num = (-exact(cur + 2 * hstep) + 8 * exact(cur + hstep)
+                            - 8 * exact(cur - hstep) + exact(cur - 2 * hstep)) / (12.0 * hstep);
+        const double scale = std::max(1.0, std::fabs(num));
+        const double noise = 10.0 * 2.2e-16 * std::fabs(f0) / hstep / scale;
+        recordCheck(w + " derivative", std::fabs(d1 - num) / scale, std::max(1e-6, noise));
+    }
+    // 3. Newton optimum vs an independent maximizer on [cur/16, 16 cur]
+    const double lo = std::max(params->min_branch_length, cur / 16.0);
+    const double hi = std::min(params->max_branch_length, std::max(16.0 * cur, lo + 1e-3));
+    double fg;
+    goldenMax(exact, lo, hi, std::max(params->min_branch_length, 1e-9), fg);
+    recordCheck(w + " optimum (logL deficit vs reference)", std::max(0.0, fg - newton_logl), 1e-6);
+}
+
+// <----- Multithreading: parallel sweep and NNI scoring ----->
+
+// resize only outside parallel regions: call workspace(nt - 1) before the loop
+PhyloTreeSciPhy::Workspace &PhyloTreeSciPhy::workspace(int t) const {
+    if ((int)workspaces.size() <= t) workspaces.resize(t + 1);
+    return workspaces[t];
+}
+
+PhyloTreeSciPhy::Workspace &PhyloTreeSciPhy::threadWorkspace() const {
+#ifdef _OPENMP
+    return workspace(omp_get_thread_num());
+#else
+    return workspace(0);
+#endif
+}
+
+bool PhyloTreeSciPhy::parallelPathEnabled() const {
+    return hasBarcodeAlignment() && !useOldKernel() && !checking() && !brlen_brent && !brlen_check
+           && !nni_cache_check;
+}
+
+int PhyloTreeSciPhy::sweepBranchClosedForm(PhyloNode *node1, PhyloNode *node2, double &new_len,
+                                           Workspace &ws) const {
+    if (rooted && (node1 == root || node2 == root)) return 0;   // origin edge: optimizeOriginBranch
+    PhyloNeighbor *n12 = (PhyloNeighbor*) node1->findNeighbor(node2);
+    PhyloNeighbor *n21 = (PhyloNeighbor*) node2->findNeighbor(node1);
+    if (!n12 || !n21) return 0;
+    PhyloNode *parent = node1, *child = node2;
+    if (n12->direction == TOWARD_ROOT) { parent = node2; child = node1; }
+    PhyloNeighbor *down_nei = (PhyloNeighbor*) parent->findNeighbor(child);
+    PhyloNeighbor *up_nei   = (PhyloNeighbor*) child->findNeighbor(parent);
+    if (!down_nei->sciphy_tape_partial || !up_nei->sciphy_tape_partial) return 0;
+    buildBranchCoeffs(*up_nei->sciphy_tape_partial, *down_nei->sciphy_tape_partial, ws.bc);
+    bool used;
+    optimizeBranchClosedForm(ws.bc, n12->length, new_len, used);
+    return used ? 1 : 2;
+}
+
+void PhyloTreeSciPhy::nniRawSwap(NNIMove &m) const {
+    NeighborVec::iterator n1it = m.node1Nei_it, n2it = m.node2Nei_it;
+    Neighbor *n1nei = *n1it, *n2nei = *n2it;
+    m.node1->updateNeighbor(n1it, n2nei);
+    n2nei->node->updateNeighbor(m.node2, m.node1);
+    m.node2->updateNeighbor(n2it, n1nei);
+    n1nei->node->updateNeighbor(m.node1, m.node2);
+}
+
+void PhyloTreeSciPhy::nniUndoSwap(NNIMove &m) const {
+    NeighborVec::iterator n1it = m.node1Nei_it, n2it = m.node2Nei_it;
+    Neighbor *cur_n1 = *n1it, *cur_n2 = *n2it;
+    m.node1->updateNeighbor(n1it, cur_n2);
+    cur_n2->node->updateNeighbor(m.node2, m.node1);
+    m.node2->updateNeighbor(n2it, cur_n1);
+    cur_n1->node->updateNeighbor(m.node1, m.node2);
+}
+
+// Virtual swap: scores both candidates like getBestNNIForBran without modifying the tree.
+void PhyloTreeSciPhy::scoreBranchNNIsVirtual(PhyloNode *node1, PhyloNode *node2, NNIMove *moves,
+                                             char *fallback, Workspace &ws) const {
+    if (((PhyloNeighbor*) node1->findNeighbor(node2))->direction == TOWARD_ROOT) std::swap(node1, node2);
+    const double NEG = -std::numeric_limits<double>::max();
+    moves[0].ptnlh = moves[1].ptnlh = nullptr;
+    int cnt = 0;
+    FOR_NEIGHBOR_IT(node1, node2, node1_it)
+        if (((PhyloNeighbor*) *node1_it)->direction != TOWARD_ROOT) {
+            cnt = 0;
+            FOR_NEIGHBOR_IT(node2, node1, node2_it) {
+                moves[cnt].node1Nei_it = node1_it;
+                moves[cnt].node2Nei_it = node2_it;
+                cnt++;
+            }
+            break;
+        }
+    ASSERT(cnt == 2);
+    moves[0].node1 = moves[1].node1 = node1;
+    moves[0].node2 = moves[1].node2 = node2;
+    moves[0].newloglh = moves[1].newloglh = NEG;
+    fallback[0] = fallback[1] = 0;
+    const double orig_len = ((PhyloNeighbor*) node1->findNeighbor(node2))->length;
+    const size_t nptn = aln->getNPattern();
+
+    for (int c = 0; c < 2; ++c) {
+        if (!const_cast<ConstraintTree&>(constraintTree).isCompatible(moves[c])) continue;
+        Neighbor *n1nei = *moves[c].node1Nei_it;   // node1 -> a
+        Neighbor *n2nei = *moves[c].node2Nei_it;   // node2 -> b
+        // node2's children after the swap (its neighbor order, b replaced by a)
+        std::vector<PhyloNeighbor*> kids2;
+        for (Neighbor *nb : node2->neighbors) {
+            Neighbor *e = (nb == n2nei) ? n1nei : nb;
+            if (e->node != node1) kids2.push_back((PhyloNeighbor*) e);
+        }
+        // node1's toward-root edge and children after the swap (a replaced by b)
+        PhyloNeighbor *pnei = nullptr, *child_nei = nullptr;
+        std::vector<PhyloNeighbor*> kids1;
+        for (Neighbor *nb : node1->neighbors) {
+            Neighbor *e = (nb == n1nei) ? n2nei : nb;
+            if (!pnei && ((PhyloNeighbor*) e)->direction == TOWARD_ROOT) { pnei = (PhyloNeighbor*) e; continue; }
+            kids1.push_back((PhyloNeighbor*) e);
+            if (e->node == node2) child_nei = (PhyloNeighbor*) e;
+        }
+        buildTapeDownwardKids(kids2, ws.down, ws);
+        buildTapeUpToCKids(pnei, kids1, child_nei, ws.down, ws.up, ws);
+        bool ok = ws.down.head.size() == nptn && ws.up.head.size() == nptn;
+        for (size_t p = 0; ok && p < nptn; ++p)
+            if (ws.down.head[p].wildcard || ws.up.head[p].wildcard) ok = false;   // as in buildNNILocalPartials
+        if (!ok) { fallback[c] = 1; continue; }
+        buildBranchCoeffs(ws.up, ws.down, ws.bc);
+        bool used;
+        double nl;
+        const double fl = optimizeBranchClosedForm(ws.bc, orig_len, nl, used);
+        if (!used) { fallback[c] = 1; continue; }
+        moves[c].newloglh = fl;
+        moves[c].newLen[0].assign(1, nl);
+    }
+}
+
+// Scores all candidates in parallel, then fallbacks sequentially; collects in branch order.
+void PhyloTreeSciPhy::evaluateNNIs(Branches &nniBranches, vector<NNIMove> &positiveNNIs) {
+    if (!parallelPathEnabled() || MPIHelper::getInstance().getNumProcesses() > 1) {
+        IQTree::evaluateNNIs(nniBranches, positiveNNIs);
+        return;
+    }
+    ensureSciPhySnapshot();
+    const double backupScore = curScore;
+    std::vector<Branch> br;
+    br.reserve(nniBranches.size());
+    for (auto &it : nniBranches) br.push_back(it.second);
+    const int nb = (int)br.size(), nt = numWorkThreads();
+    std::vector<NNIMove> moves(2 * nb);
+    std::vector<char> fb(2 * nb, 0);
+    workspace(nt - 1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 4) num_threads(nt) if (nt > 1)
+#endif
+    for (int i = 0; i < nb; ++i) {
+        Workspace &ws = threadWorkspace();
+        scoreBranchNNIsVirtual((PhyloNode*) br[i].first, (PhyloNode*) br[i].second, &moves[2 * i], &fb[2 * i], ws);
+    }
+    // fallbacks: swap, score and unswap on the tree
+    for (int i = 0; i < nb; ++i) {
+        if (!fb[2 * i] && !fb[2 * i + 1]) continue;
+        ensureSciPhySnapshot();
+        PhyloNeighbor *central      = (PhyloNeighbor*) moves[2 * i].node1->findNeighbor(moves[2 * i].node2);
+        PhyloNeighbor *central_back = (PhyloNeighbor*) moves[2 * i].node2->findNeighbor(moves[2 * i].node1);
+        const double orig_len = central->length;
+        for (int c = 0; c < 2; ++c) {
+            if (!fb[2 * i + c]) continue;
+            NNIMove &m = moves[2 * i + c];
+            nniRawSwap(m);
+            double optlen;
+            const double score = scoreNNICandidate(m.node1, m.node2, c, orig_len, optlen);
+            central->length = central_back->length = orig_len;
+            m.newloglh = score;
+            m.newLen[0].assign(1, optlen);
+            nniUndoSwap(m);
+        }
+    }
+    ensureSciPhySnapshot();
+    curScore = backupScore;
+    for (int i = 0; i < nb; ++i) {
+        const NNIMove &best = (moves[2 * i].newloglh > moves[2 * i + 1].newloglh) ? moves[2 * i] : moves[2 * i + 1];
+        if (best.newloglh > curScore) positiveNNIs.push_back(best);
     }
 }

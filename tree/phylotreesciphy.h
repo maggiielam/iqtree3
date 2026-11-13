@@ -94,6 +94,9 @@ public:
     // Apply only the central branch length recorded by getBestNNIForBran.
     virtual void changeNNIBrans(NNIMove &nnimove) override;
 
+    // parallel NNI scoring (virtual swaps)
+    virtual void evaluateNNIs(Branches &nniBranches, vector<NNIMove> &positiveNNIs) override;
+
     // Memory: the base class's dense buffers are sized by num_states (= #distinct tape
     // vectors, ~1e4 on real data); barcode data allocates only per-pattern arrays.
     using IQTree::getMemoryRequired;
@@ -243,6 +246,11 @@ protected:
     SciPhyKernel sciphy_kernel = SCIPHY_KERNEL_TAPE;
     bool print_ll = false;
     bool nni_cache_check = false;
+    // IQTREE_SCIPHY_BRLEN=brent: Brent instead of Newton; IQTREE_SCIPHY_CHECK_BRLEN=1: checks
+    bool brlen_brent = false;
+    bool brlen_check = false;
+    // Newton branch lengths in use
+    bool closedFormBrlen() const { return !useOldKernel() && !checking() && !brlen_brent; }
     bool useOldKernel() const { return sciphy_kernel == SCIPHY_KERNEL_OLD; }
     bool checking() const { return sciphy_kernel >= SCIPHY_KERNEL_CHECK; }
     // old kernel's tail as a direct sum (check mode only)
@@ -284,22 +292,78 @@ protected:
 
     // table for a branch of the given length (mean edits = clock * length)
     void fillBranchTable(double len, BranchTable &bt) const;
+
+    // Closed-form branch likelihood: per-tape Poisson coefficients, independent of the length
+    struct BranchCoeffs {
+        std::vector<double> c, e;            // per tape, tape_lh_offset layout (L+1 slots)
+        std::vector<double> scale;           // per tape: log_scale terms (constant in len)
+        std::vector<unsigned char> active;   // tape depends on len
+        double const_logl = 0.0;             // sum over constant tapes of w * logL
+    };
+    // U = UpToC(parent) seen from the child, D = Down(child)
+    void buildBranchCoeffs(const SciPhyTapePartials &U, const SciPhyTapePartials &D, BranchCoeffs &bc) const;
+    // origin edge: the parent is the unedited founder
+    void buildOriginCoeffs(const SciPhyTapePartials &bio, BranchCoeffs &bc) const;
+    // logL and first/second derivatives at len; ok = false if Brent is needed
+    double branchLogL(const BranchCoeffs &bc, double len, double *d1, double *d2, bool &ok) const;
+    // safeguarded Newton; false = use Brent
+    bool newtonBranchLength(const BranchCoeffs &bc, double x, double f, double g, double h,
+                            double &best_len, double &best_logl) const;
+    // optimal length of one branch; used_newton = false means fall back to Brent
+    double optimizeBranchClosedForm(const BranchCoeffs &bc, double cur, double &new_len,
+                                    bool &used_newton) const;
+    mutable BranchCoeffs brlen_bc;           // scratch for the sequential callers
+    // IQTREE_SCIPHY_CHECK_BRLEN: closed form, derivative and optimum vs the exact likelihood
+    template <class Exact>
+    void checkBranchClosedForm(const char *where, const BranchCoeffs &bc, double cur,
+                               double newton_len, double newton_logl, Exact exact);
+    void recordCheck(const std::string &key, double err, double thresh);
     void sizeTapePartials(SciPhyTapePartials &tp) const;
     SciPhyTapePartials &tapePartials(PhyloNeighbor *nei) const;
 
-    // lh[i] *= sum_j T(i,j) child[j] for one child branch; underflow flags tape p in tape_redo
+    // per-thread scratch, so the const kernel functions below can run in parallel
+    struct Workspace {
+        std::vector<char> redo;              // per tape: recompute in log space
+        SciPhyTapePartials upbar;            // UpBar(node) in the upward pass
+        SciPhyTapePartials down, up;         // local partials of an NNI candidate
+        BranchCoeffs bc;                     // closed-form branch coefficients
+    };
+    mutable std::vector<Workspace> workspaces;
+    int numWorkThreads() const { return std::max(1, num_threads); }
+    Workspace &workspace(int t = 0) const;
+    Workspace &threadWorkspace() const;      // the calling OpenMP thread's workspace
+
+    // lh[i] *= sum_j T(i,j) child[j] for one child branch; underflow flags tape p in redo
     void multiplyChild(const BranchTable &bt, int p, const SciPhyTapeHead &c,
-                       const double *child_lh, SciPhyTapeHead &h, double *lh);
+                       const double *child_lh, SciPhyTapeHead &h, double *lh,
+                       std::vector<char> &redo) const;
     // support (rep, depth) of the observed kids' common prefix; headOf(kid) gives its head
     template <class HeadOf>
     void commonSupport(const std::vector<PhyloNeighbor*> &kids, HeadOf headOf,
                        int &rep, int &depth) const;
 
+    // Down partials below dad_branch; parallel over the nodes of each height level
     void computeTapeDownward(PhyloNeighbor *dad_branch, PhyloNode *dad);
+    // Down partial on dad_branch from its children's (already computed) Down partials
+    void computeTapeDownNode(PhyloNeighbor *dad_branch, PhyloNode *dad, Workspace &ws) const;
     // Down partial of a node from its children's cached Down partials.
-    void combineTapeChildren(const std::vector<PhyloNeighbor*> &kids, SciPhyTapePartials &out);
+    void combineTapeChildren(const std::vector<PhyloNeighbor*> &kids, SciPhyTapePartials &out,
+                             Workspace &ws) const;
+    // UpToC partials on every edge; parallel over the nodes of each depth level
     void computeTapeFullUpward();
-    void computeTapeUpward(PhyloNode *node, PhyloNode *dad);
+    // UpToC(node) on every (child -> node) half-edge, given UpToC(dad) on (node -> dad)
+    void computeTapeUpwardNode(PhyloNode *node, PhyloNode *dad, Workspace &ws) const;
+    // one branch of the parallel sweep: 0 = skipped, 1 = new_len set, 2 = needs Brent
+    int sweepBranchClosedForm(PhyloNode *node1, PhyloNode *node2, double &new_len, Workspace &ws) const;
+    // scores both NNI candidates of a branch without changing the tree; fallback[c] = 1 if
+    // candidate c needs the sequential path
+    void scoreBranchNNIsVirtual(PhyloNode *node1, PhyloNode *node2, NNIMove *moves, char *fallback,
+                                Workspace &ws) const;
+    // swap / unswap a candidate on the tree (sequential fallback path)
+    void nniRawSwap(NNIMove &m) const;
+    void nniUndoSwap(NNIMove &m) const;
+    // parallel paths enabled (off in check/debug modes)
+    bool parallelPathEnabled() const;
     double combineTape(const SciPhyTapePartials &up, const SciPhyTapePartials &down,
                        double len, double *pattern_lh_out = nullptr) const;
     double originClosureTape(const SciPhyTapePartials &bio, double t, double *pattern_lh_out);
@@ -307,16 +371,19 @@ protected:
     // child_down: as in buildUpToCLocal
     void buildTapeUpToCLocal(PhyloNode *parent, PhyloNode *child,
                              const SciPhyTapePartials &child_down, SciPhyTapePartials &out);
+    // same, from explicit neighbor lists (scores a candidate topology without rewiring the tree)
+    void buildTapeDownwardKids(const std::vector<PhyloNeighbor*> &kids, SciPhyTapePartials &out,
+                               Workspace &ws) const;
+    void buildTapeUpToCKids(PhyloNeighbor *pnei, const std::vector<PhyloNeighbor*> &kids,
+                            PhyloNeighbor *child_nei, const SciPhyTapePartials &child_down,
+                            SciPhyTapePartials &out, Workspace &ws) const;
 
     // One tape of a node partial in log space (fallback when the linear result underflows):
     // log lh[s] = log sum_i up[i] T(i,s) (if up, over up_len) + sum_{kids != skip} log sum_j T(s,j) kid[j].
     // Normalizes lh[0..depth] to max 1 and returns log(max); constants (log_scale) are not included.
     double tapeLogs(int p, int rep, int depth, const SciPhyTapePartials *up, int up_depth, double up_len,
                     const std::vector<PhyloNeighbor*> &kids, const PhyloNeighbor *skip, double *lh) const;
-    std::vector<char> tape_redo;                        // per tape: recompute in log space
-
-    SciPhyTapePartials tape_upbar;                      // scratch for the upward pass
-    SciPhyTapePartials tape_nni_up, tape_nni_down;      // NNI candidate partials
+    SciPhyTapePartials tape_nni_up, tape_nni_down;      // NNI candidate partials (sequential path)
     const SciPhyTapePartials *sciphy_nni_up_tape   = nullptr;
     const SciPhyTapePartials *sciphy_nni_down_tape = nullptr;
 };

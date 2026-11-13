@@ -447,7 +447,7 @@ public:
      * @param nniBranches [IN] branches the branches on which NNIs will be evaluated
      * @return list positive NNIs
      */
-    void evaluateNNIs(Branches &nniBranches, vector<NNIMove> &outNNIMoves);
+    virtual void evaluateNNIs(Branches &nniBranches, vector<NNIMove> &outNNIMoves);
 
     double optimizeNNIBranches(Branches &nniBranches);
 
